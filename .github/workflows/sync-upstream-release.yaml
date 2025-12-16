@@ -1,0 +1,153 @@
+name: Sync Upstream Release (Only When Updated)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"  # 每6小时检查一次；想更省就改成每天一次：0 3 * * *
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout patched-release
+        uses: actions/checkout@v4
+        with:
+          ref: patched-release
+          fetch-depth: 0
+
+      - name: Get upstream latest release tag
+        id: upstream
+        run: |
+          set -e
+          # runner 通常自带 jq；如果你的环境没 jq，把下一行取消注释安装
+          # sudo apt-get update && sudo apt-get install -y jq
+
+          TAG=$(curl -s https://api.github.com/repos/MatsuriDayo/NekoBoxForAndroid/releases/latest | jq -r .tag_name)
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Upstream latest tag: $TAG"
+
+      - name: Read current synced tag (from patched-release)
+        id: current
+        run: |
+          set -e
+          if [ -f .upstream_release_tag ]; then
+            CUR=$(cat .upstream_release_tag)
+          else
+            CUR=""
+          fi
+          echo "tag=$CUR" >> $GITHUB_OUTPUT
+          echo "Current tag: $CUR"
+
+      - name: Exit if no update
+        if: steps.upstream.outputs.tag == steps.current.outputs.tag
+        run: echo "No new upstream release tag. Skip sync & build."
+
+      - name: Sync upstream tag -> patched-release, then apply UI changes
+        if: steps.upstream.outputs.tag != steps.current.outputs.tag
+        run: |
+          set -e
+
+          git remote add upstream https://github.com/MatsuriDayo/NekoBoxForAndroid.git || true
+          git fetch upstream --tags --force
+
+          TAG="${{ steps.upstream.outputs.tag }}"
+          echo "Syncing to tag: $TAG"
+
+          # 让 patched-release 变成“上游发布版源码”
+          git reset --hard "refs/tags/$TAG"
+
+          # ====== 自动应用你的 UI 改动（不依赖本地/不依赖补丁文件）======
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          def replace_or_fail(p: Path, pattern: str, repl: str, desc: str):
+            s = p.read_text(encoding="utf-8")
+            new, n = re.subn(pattern, repl, s, flags=re.S)
+            if n == 0:
+              raise SystemExit(f"[FAIL] Pattern not found for {desc} in {p}")
+            p.write_text(new, encoding="utf-8")
+            print(f"[OK] {desc} ({n} replaced)")
+
+          # 1) AboutFragment：删除 donate 块
+          about = Path("app/src/main/java/io/nekohasekai/sagernet/ui/AboutFragment.kt")
+          replace_or_fail(
+            about,
+            r"""
+            \.addItem\(\s*
+              MaterialAboutActionItem\.Builder\(\)\s*
+              .*?ic_baseline_card_giftcard_24.*?
+              \.text\(R\.string\.donate\)\s*
+              \.subText\(R\.string\.donate_info\)\s*
+              .*?matsuridayo\.github\.io/index_docs/#donate.*?
+              \.build\(\)\s*
+            \)\s*
+            """,
+            "",
+            "Remove donate item in AboutFragment"
+          )
+
+          # 2) main_drawer_menu：删除 推广/文档 两个 item
+          menu = Path("app/src/main/res/menu/main_drawer_menu.xml")
+          replace_or_fail(
+            menu,
+            r"""\s*<item\b[^>]*android:id="@\+id/nav_tuiguang"[^>]*/>\s*""",
+            "\n",
+            "Remove nav_tuiguang item from drawer menu"
+          )
+          replace_or_fail(
+            menu,
+            r"""\s*<item\b[^>]*android:id="@\+id/nav_faq"[^>]*/>\s*""",
+            "\n",
+            "Remove nav_faq item from drawer menu"
+          )
+
+          # 3) MainActivity：删除可见性控制行 + 两个 when 分支
+          main = Path("app/src/main/java/io/nekohasekai/sagernet/ui/MainActivity.kt")
+          replace_or_fail(
+            main,
+            r"""\n[ \t]*navigation\.menu\.findItem\(R\.id\.nav_tuiguang\)\?\.\s*isVisible\s*=\s*!isPlay[ \t]*\n""",
+            "\n",
+            "Remove nav_tuiguang visibility line"
+          )
+          replace_or_fail(
+            main,
+            r"""R\.id\.nav_faq\s*->\s*\{.*?\}\s*""",
+            "",
+            "Remove nav_faq handler block"
+          )
+          replace_or_fail(
+            main,
+            r"""R\.id\.nav_tuiguang\s*->\s*\{.*?\}\s*""",
+            "",
+            "Remove nav_tuiguang handler block"
+          )
+          PY
+          # ==========================================================
+
+          # 记录同步到的 release tag（用于下次对比，避免无意义编译）
+          echo "$TAG" > .upstream_release_tag
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Sync upstream release $TAG + apply UI patches" || true
+
+          # 强制更新 patched-release（因为 reset 到 tag）
+          git push --force-with-lease origin HEAD:patched-release
+
+      - name: Trigger build workflow (only when updated)
+        if: steps.upstream.outputs.tag != steps.current.outputs.tag
+        run: |
+          set -e
+          # 触发 main 分支上的 build workflow（它会去 checkout patched-release 来编译）
+          curl -s -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/build-patched-release.yml/dispatches \
+            -d '{"ref":"main"}' >/dev/null
+          echo "Build workflow dispatched."
