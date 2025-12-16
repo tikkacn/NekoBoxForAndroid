@@ -1,11 +1,10 @@
-name: Build Patched Release (Signed, Preview+Stable)
+name: Build Patched Release (Preview Debug APK)
 
 on:
   workflow_dispatch:
 
-permissions:
-  contents: write   # 需要创建 GitHub Release
-  actions: read
+env:
+  TZ: Asia/Shanghai
 
 jobs:
   libcore:
@@ -18,190 +17,92 @@ jobs:
           ref: patched-release
 
       - name: Golang Status
-        run: find buildScript libcore/*.sh | xargs cat | sha1sum > golang_status
+        run: |
+          find buildScript libcore/*.sh | xargs cat | sha1sum > golang_status
 
       - name: Libcore Status
-        run: git ls-files libcore | xargs cat | sha1sum > libcore_status
+        run: |
+          git ls-files libcore | xargs cat | sha1sum > libcore_status
 
-      - name: LibCore Cache
-        id: cache
+      - name: Restore LibCore Cache
+        id: libcore_cache
         uses: actions/cache@v4
         with:
-          path: |
-            app/libs/libcore.aar
-          key: ${{ hashFiles('.github/workflows/*', 'golang_status', 'libcore_status') }}
+          path: app/libs/libcore.aar
+          key: libcore-${{ runner.os }}-${{ hashFiles('golang_status', 'libcore_status', '.github/workflows/**') }}
+          restore-keys: |
+            libcore-${{ runner.os }}-
 
       - name: Install Golang
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.libcore_cache.outputs.cache-hit != 'true'
         uses: actions/setup-go@v5
         with:
           go-version: ^1.25
 
       - name: Native Build
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.libcore_cache.outputs.cache-hit != 'true'
         run: ./run lib core
 
   build:
-    name: Build + Sign + Release
+    name: Build APK (Preview Debug, installable)
     runs-on: ubuntu-latest
-    needs:
-      - libcore
-
+    needs: [libcore]
     steps:
       - name: Checkout patched-release
         uses: actions/checkout@v4
         with:
           ref: patched-release
-          fetch-depth: 0
+
+      - name: Golang Status
+        run: |
+          find buildScript libcore/*.sh | xargs cat | sha1sum > golang_status
+
+      - name: Libcore Status
+        run: |
+          git ls-files libcore | xargs cat | sha1sum > libcore_status
 
       - name: Restore LibCore Cache
         uses: actions/cache@v4
         with:
-          path: |
-            app/libs/libcore.aar
-          key: ${{ hashFiles('.github/workflows/*', 'golang_status', 'libcore_status') }}
+          path: app/libs/libcore.aar
+          key: libcore-${{ runner.os }}-${{ hashFiles('golang_status', 'libcore_status', '.github/workflows/**') }}
+          restore-keys: |
+            libcore-${{ runner.os }}-
+
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
 
       - name: Gradle cache
         uses: actions/cache@v4
         with:
-          path: ~/.gradle
-          key: gradle-oss-${{ hashFiles('**/*.gradle.kts', '**/*.gradle', '**/gradle-wrapper.properties') }}
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', '**/gradle.properties', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
 
-      - name: Prepare Build Env
+      - name: Gradle Build (Preview Debug)
         env:
           BUILD_PLUGIN: none
         run: |
           set -e
           echo "sdk.dir=${ANDROID_HOME}" > local.properties
           echo "ndk.dir=${ANDROID_HOME}/ndk/25.0.8775105" >> local.properties
+
           ./run init action gradle
+          ./gradlew app:assemblePreviewDebug
 
-      - name: Build Preview + Stable (auto-detect tasks)
-        env:
-          BUILD_PLUGIN: none
-        run: |
-          set -e
+          APK_FILE=$(find app/build/outputs/apk -type f -name "*arm64-v8a*.apk" | head -n 1)
+          echo "Found APK: $APK_FILE"
+          APK_DIR=$(dirname "$APK_FILE")
+          echo "APK=$APK_DIR" >> $GITHUB_ENV
 
-          # 选择一个“稳定版 release”任务（优先 oss）
-          if ./gradlew -q tasks --all | grep -q "assembleOssRelease"; then
-            RELEASE_TASK="app:assembleOssRelease"
-          else
-            RELEASE_TASK="app:assembleRelease"
-          fi
-
-          # 选择一个“预览版”任务（优先 PreviewRelease，其次 PreviewDebug）
-          if ./gradlew -q tasks --all | grep -q "assemblePreviewRelease"; then
-            PREVIEW_TASK="app:assemblePreviewRelease"
-          else
-            PREVIEW_TASK="app:assemblePreviewDebug"
-          fi
-
-          echo "Using tasks: $RELEASE_TASK + $PREVIEW_TASK"
-          ./gradlew "$RELEASE_TASK" "$PREVIEW_TASK"
-
-      - name: Decode keystore (PKCS12)
-        env:
-          SIGNING_KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_B64 }}
-        run: |
-          set -e
-          mkdir -p signing
-          # 防止换行/空格问题：用 printf
-          printf '%s' "$SIGNING_KEYSTORE_B64" | base64 -d > signing/signing.p12
-          ls -l signing/signing.p12
-
-      - name: Sign APKs (zipalign + apksigner)
-        env:
-          KS_PASS: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
-          KEY_PASS: ${{ secrets.SIGNING_KEY_PASSWORD }}
-        run: |
-          set -e
-
-          # 找到最新 build-tools 的 apksigner/zipalign
-          BUILD_TOOLS_DIR="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)"
-          APKSIGNER="$BUILD_TOOLS_DIR/apksigner"
-          ZIPALIGN="$BUILD_TOOLS_DIR/zipalign"
-
-          echo "Using build-tools: $BUILD_TOOLS_DIR"
-          "$APKSIGNER" --version
-          "$ZIPALIGN" -h >/dev/null 2>&1 || true
-
-          mkdir -p signed_apks
-
-          # 收集所有 apk（release/preview/debug 都可能在这里）
-          mapfile -t APK_LIST < <(find app/build/outputs/apk -type f -name "*.apk" | sort)
-
-          echo "Found APKs:"
-          printf ' - %s\n' "${APK_LIST[@]}"
-
-          for apk in "${APK_LIST[@]}"; do
-            base="$(basename "$apk")"
-            out_aligned="signed_apks/${base%.apk}-aligned.apk"
-            out_signed="signed_apks/${base%.apk}-signed.apk"
-
-            # zipalign（如果已对齐也不影响）
-            "$ZIPALIGN" -f -p 4 "$apk" "$out_aligned"
-
-            # apksigner sign（强制用你的 p12 签）
-            "$APKSIGNER" sign \
-              --ks signing/signing.p12 \
-              --ks-type PKCS12 \
-              --ks-key-alias "$KEY_ALIAS" \
-              --ks-pass "pass:$KS_PASS" \
-              --key-pass "pass:$KEY_PASS" \
-              --out "$out_signed" \
-              "$out_aligned"
-
-            # 校验
-            "$APKSIGNER" verify --verbose "$out_signed" | head -n 30 || true
-          done
-
-          echo "Signed APKs:"
-          ls -lh signed_apks
-
-      - name: Compute Release Tag/Name (Asia/Shanghai)
-        id: rel
-        run: |
-          set -e
-          TZ="Asia/Shanghai"
-          export TZ
-
-          UPSTREAM_TAG="unknown"
-          if [ -f ".upstream_release_tag" ]; then
-            UPSTREAM_TAG="$(cat .upstream_release_tag | tr -d ' \n\r\t')"
-          fi
-
-          BUILD_TS="$(date +%Y%m%d-%H%M)"
-          TAG="patched-${UPSTREAM_TAG}+build-${BUILD_TS}-${GITHUB_RUN_NUMBER}"
-          NAME="Patched ${UPSTREAM_TAG} (${BUILD_TS} CST)"
-
-          echo "UPSTREAM_TAG=$UPSTREAM_TAG" >> $GITHUB_ENV
-          echo "RELEASE_TAG=$TAG" >> $GITHUB_ENV
-          echo "RELEASE_NAME=$NAME" >> $GITHUB_ENV
-
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "name=$NAME" >> $GITHUB_OUTPUT
-
-      - name: Upload signed APKs artifact
+      - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
-          name: signed-apks
-          path: signed_apks/*.apk
-
-      - name: Create GitHub Release + upload APKs
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: ${{ env.RELEASE_NAME }}
-          body: |
-            Upstream: ${{ env.UPSTREAM_TAG }}
-            Branch: patched-release
-            Built at: Asia/Shanghai (CST)
-
-            Included:
-            - Preview build (signed)
-            - Stable build (signed)
-          files: |
-            signed_apks/*.apk
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: APKs
+          path: ${{ env.APK }}
