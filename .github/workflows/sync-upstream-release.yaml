@@ -59,10 +59,10 @@ jobs:
           TAG="${{ steps.upstream.outputs.tag }}"
           echo "Syncing to tag: $TAG"
 
-          # patched-release 先完全对齐上游 tag（重要：自动“修复”之前删坏的 MainActivity）
+          # patched-release 先完全对齐上游 tag（用于修复任何历史误改）
           git reset --hard "refs/tags/$TAG"
 
-          # ====== 应用你的 UI 改动：只隐藏菜单 + 删除 About donate ======
+          # ====== 应用你的 UI 改动：隐藏菜单 + 删除 About donate ======
           python3 - <<'PY'
           import re
           from pathlib import Path
@@ -105,7 +105,42 @@ jobs:
               write(p, new)
               print(f"[OK] {desc}")
 
-          def hide_menu_item(menu_dir: Path, item_id: str):
+          def hide_menu_items_by_id(menu_dir: Path, item_ids: list[str]):
+              if not menu_dir.exists():
+                  print(f"[WARN] menu dir not found: {menu_dir}")
+                  return
+
+              for item_id in item_ids:
+                  found_any = False
+                  for xml in menu_dir.rglob("*.xml"):
+                      s = read(xml)
+                      # 命中含 id 的 <item ...> 标签（自闭合/非自闭合都可以）
+                      def repl(m):
+                          nonlocal found_any
+                          tag = m.group(0)
+                          if "android:visible=" in tag:
+                              found_any = True
+                              return tag
+                          found_any = True
+                          return tag.replace("<item", '<item android:visible="false"', 1)
+
+                      new = re.sub(
+                          rf"<item\b[^>]*android:id=\"@\+id/{re.escape(item_id)}\"[^>]*?/?>",
+                          repl,
+                          s,
+                          flags=re.S,
+                      )
+                      if new != s:
+                          write(xml, new)
+                          print(f"[OK] Hide {item_id} in {xml}")
+
+                  if not found_any:
+                      print(f"[WARN] Menu item id not found anywhere: {item_id}")
+
+          def hide_menu_items_by_title(menu_dir: Path, title_value: str, label: str):
+              """
+              title_value 例子：@string/ads
+              """
               if not menu_dir.exists():
                   print(f"[WARN] menu dir not found: {menu_dir}")
                   return
@@ -113,8 +148,7 @@ jobs:
               found_any = False
               for xml in menu_dir.rglob("*.xml"):
                   s = read(xml)
-                  # 找到包含该 id 的 <item ...> 标签（自闭合/非自闭合都处理）
-                  # 如果已经有 android:visible 就不改
+
                   def repl(m):
                       nonlocal found_any
                       tag = m.group(0)
@@ -122,38 +156,52 @@ jobs:
                           found_any = True
                           return tag
                       found_any = True
-                      # 在 <item 后插入属性最稳
                       return tag.replace("<item", '<item android:visible="false"', 1)
 
                   new = re.sub(
-                      rf"<item\b[^>]*android:id=\"@\+id/{re.escape(item_id)}\"[^>]*?/?>",
+                      rf"<item\b[^>]*android:title=\"{re.escape(title_value)}\"[^>]*?/?>",
                       repl,
                       s,
                       flags=re.S,
                   )
                   if new != s:
                       write(xml, new)
-                      print(f"[OK] Hide {item_id} in {xml}")
+                      print(f"[OK] Hide {label} (title={title_value}) in {xml}")
 
               if not found_any:
-                  print(f"[WARN] Menu item id not found anywhere: {item_id}")
+                  print(f"[WARN] Menu item with title={title_value} not found in any menu xml")
 
           # 1) About：删 donate item
           about = Path("app/src/main/java/io/nekohasekai/sagernet/ui/AboutFragment.kt")
           remove_additem_block_containing(about, "R.string.donate", "Remove donate item in AboutFragment")
 
-          # 2) 侧边栏菜单：隐藏（不删除，避免 R.id 消失导致编译/逻辑出问题）
+          # 2) 侧边栏菜单：优先按 id 隐藏（你原来的两个）
           menu_dir = Path("app/src/main/res/menu")
-          hide_menu_item(menu_dir, "nav_tuiguang")
-          hide_menu_item(menu_dir, "nav_faq")
+          hide_menu_items_by_id(menu_dir, ["nav_tuiguang", "nav_faq"])
+
+          # 3) 兜底：按 title 隐藏“推广”（@string/ads），避免上游改了 id 还漏掉
+          hide_menu_items_by_title(menu_dir, "@string/ads", "ads")
+
+          # === DEBUG: 打印所有 menu item id，方便你确认“推广”真实 id ===
+          try:
+              ids = []
+              for xml in menu_dir.rglob("*.xml"):
+                  s = read(xml)
+                  for m in re.finditer(r'android:id="@\+id/([^"]+)"', s):
+                      ids.append((m.group(1), str(xml)))
+              print("[DEBUG] menu item ids:")
+              for item_id, xml in ids:
+                  print(f"  - {item_id}  ({xml})")
+          except Exception as e:
+              print("[DEBUG] scan menu ids failed:", e)
 
           PY
           # ============================================================
 
-          # 关键：patched-release 分支不要包含 workflows（否则 push 会被拒）
+          # patched-release 分支不要包含 workflows（否则 push 可能被拒/权限限制）
           rm -rf .github/workflows || true
 
-          # 记录这次同步到的 tag
+          # 记录同步到的 tag
           echo "$TAG" > .upstream_release_tag
 
           git config user.name "github-actions[bot]"
