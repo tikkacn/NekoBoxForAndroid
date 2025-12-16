@@ -2,6 +2,11 @@ name: Sync Upstream Release (Only When Updated)
 
 on:
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Force re-sync & re-apply patches even if tag unchanged"
+        required: false
+        default: "false"
   schedule:
     - cron: "0 */6 * * *" # 每6小时检查一次；想更省就改成每天一次：0 3 * * *
 
@@ -40,11 +45,11 @@ jobs:
           echo "Current tag: $CUR"
 
       - name: Exit if no update
-        if: steps.upstream.outputs.tag == steps.current.outputs.tag
+        if: steps.upstream.outputs.tag == steps.current.outputs.tag && inputs.force != 'true'
         run: echo "No new upstream release tag. Skip sync & build."
 
       - name: Sync upstream tag -> patched-release, then apply UI changes
-        if: steps.upstream.outputs.tag != steps.current.outputs.tag
+        if: steps.upstream.outputs.tag != steps.current.outputs.tag || inputs.force == 'true'
         run: |
           set -e
 
@@ -114,15 +119,56 @@ jobs:
                       write(xml, s)
                       print(f"[OK] Removed menu items in {xml}")
 
-          def remove_when_case_block(p: Path, rid: str, desc: str):
+          # 关键修复：按 { } 配对删除 when case，避免正则删坏 Kotlin
+          def remove_when_case_block_by_braces(p: Path, rid: str, desc: str):
               s = read(p)
-              pat = rf"\s*R\.id\.{re.escape(rid)}\s*->\s*\{{.*?\}}\s*"
-              new, n = re.subn(pat, "", s, flags=re.S)
-              if n == 0:
-                  print(f"[WARN] {desc}: not found (R.id.{rid}) in {p}, skip")
-              else:
+              key = f"R.id.{rid}"
+              i = s.find(key)
+              if i == -1:
+                  print(f"[WARN] {desc}: not found ({key}) in {p}, skip")
+                  return
+
+              line_start = s.rfind("\n", 0, i)
+              line_start = 0 if line_start == -1 else line_start + 1
+
+              arrow = s.find("->", i)
+              if arrow == -1:
+                  raise SystemExit(f"[FAIL] {desc}: '->' not found after {key} in {p}")
+
+              brace = s.find("{", arrow)
+              if brace == -1:
+                  # 罕见情况：没用大括号包裹，直接删到行尾
+                  line_end = s.find("\n", arrow)
+                  line_end = len(s) if line_end == -1 else line_end + 1
+                  new = s[:line_start] + s[line_end:]
                   write(p, new)
-                  print(f"[OK] {desc}")
+                  print(f"[OK] {desc} (line form)")
+                  return
+
+              depth = 0
+              end = None
+              for j in range(brace, len(s)):
+                  c = s[j]
+                  if c == "{":
+                      depth += 1
+                  elif c == "}":
+                      depth -= 1
+                      if depth == 0:
+                          end = j + 1
+                          break
+              if end is None:
+                  raise SystemExit(f"[FAIL] {desc}: cannot match braces for {key} in {p}")
+
+              # 吃掉一点尾部空白/换行，避免留下奇怪空行
+              while end < len(s) and s[end] in " \t\r\n":
+                  if s[end] == "\n":
+                      end += 1
+                      break
+                  end += 1
+
+              new = s[:line_start] + s[end:]
+              write(p, new)
+              print(f"[OK] {desc}")
 
           def remove_line_by_regex(p: Path, pat: str, desc: str):
               s = read(p)
@@ -137,16 +183,13 @@ jobs:
           about = Path("app/src/main/java/io/nekohasekai/sagernet/ui/AboutFragment.kt")
           remove_additem_block_containing(about, "R.string.donate", "Remove donate item in AboutFragment")
 
-          # 2) drawer 菜单：在所有 res/menu 里删 nav_tuiguang/nav_faq
-          remove_menu_items_everywhere(
-              Path("app/src/main/res/menu"),
-              ["nav_tuiguang", "nav_faq"]
-          )
+          # 2) drawer 菜单：在所有 res/menu 里删 nav_tuiguang/nav_faq（若上游换id会 WARN，不影响编译）
+          remove_menu_items_everywhere(Path("app/src/main/res/menu"), ["nav_tuiguang", "nav_faq"])
 
-          # 3) MainActivity：删处理分支 + 可见性控制行
+          # 3) MainActivity：删处理分支 + 可见性控制行（这里用括号配对，最稳）
           main = Path("app/src/main/java/io/nekohasekai/sagernet/ui/MainActivity.kt")
-          remove_when_case_block(main, "nav_faq", "Remove nav_faq handler block")
-          remove_when_case_block(main, "nav_tuiguang", "Remove nav_tuiguang handler block")
+          remove_when_case_block_by_braces(main, "nav_faq", "Remove nav_faq handler block")
+          remove_when_case_block_by_braces(main, "nav_tuiguang", "Remove nav_tuiguang handler block")
           remove_line_by_regex(
               main,
               r"^[ \t]*navigation\.menu\.findItem\(R\.id\.nav_tuiguang\)\?\.[^\n]*\n",
@@ -166,11 +209,10 @@ jobs:
           git add -A
           git commit -m "Sync upstream release $TAG + apply UI patches" || true
 
-          # 强制更新 patched-release（因为 reset 到 tag）
           git push --force-with-lease origin HEAD:patched-release
 
       - name: Trigger build workflow (only when updated)
-        if: steps.upstream.outputs.tag != steps.current.outputs.tag
+        if: steps.upstream.outputs.tag != steps.current.outputs.tag || inputs.force == 'true'
         run: |
           set -e
           curl -s -X POST \
