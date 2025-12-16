@@ -1,7 +1,8 @@
 name: Preview Build
+
 on:
   workflow_dispatch:
-    inputs:
+
 jobs:
   libcore:
     name: Native Build (LibCore)
@@ -9,10 +10,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Golang Status
         run: find buildScript libcore/*.sh | xargs cat | sha1sum > golang_status
+
       - name: Libcore Status
         run: git ls-files libcore | xargs cat | sha1sum > libcore_status
+
       - name: LibCore Cache
         id: cache
         uses: actions/cache@v4
@@ -20,14 +24,17 @@ jobs:
           path: |
             app/libs/libcore.aar
           key: ${{ hashFiles('.github/workflows/*', 'golang_status', 'libcore_status') }}
+
       - name: Install Golang
         if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/setup-go@v5
         with:
           go-version: ^1.25
+
       - name: Native Build
         if: steps.cache.outputs.cache-hit != 'true'
         run: ./run lib core
+
   build:
     name: Build OSS APK
     runs-on: ubuntu-latest
@@ -36,34 +43,49 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Golang Status
         run: find buildScript libcore/*.sh | xargs cat | sha1sum > golang_status
+
       - name: Libcore Status
         run: git ls-files libcore | xargs cat | sha1sum > libcore_status
+
       - name: LibCore Cache
         uses: actions/cache@v4
         with:
           path: |
             app/libs/libcore.aar
           key: ${{ hashFiles('.github/workflows/*', 'golang_status', 'libcore_status') }}
+
       - name: Gradle cache
         uses: actions/cache@v4
         with:
           path: ~/.gradle
           key: gradle-oss-${{ hashFiles('**/*.gradle.kts') }}
-      - name: Gradle Build
+
+      - name: Gradle Build (Debug, signed)
         env:
           BUILD_PLUGIN: none
         run: |
+          set -e
           echo "sdk.dir=${ANDROID_HOME}" > local.properties
           echo "ndk.dir=${ANDROID_HOME}/ndk/25.0.8775105" >> local.properties
+
+          # keep original init steps
           export LOCAL_PROPERTIES="${{ secrets.LOCAL_PROPERTIES }}"
           ./run init action gradle
-          ./gradlew app:assemblePreviewRelease
-          APK=$(find app/build/outputs/apk -name '*arm64-v8a*.apk')
-          APK=$(dirname $APK)
-          echo "APK=$APK" >> $GITHUB_ENV
-      - uses: actions/upload-artifact@v4
+
+          # ✅ build DEBUG so APK is signed and installable
+          ./gradlew app:assemblePreviewDebug
+
+          # Export APK output dir for artifact upload
+          APK_FILE=$(find app/build/outputs/apk -type f -name "*arm64-v8a*.apk" | head -n 1)
+          echo "Found APK: $APK_FILE"
+          APK_DIR=$(dirname "$APK_FILE")
+          echo "APK=$APK_DIR" >> $GITHUB_ENV
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
         with:
           name: APKs
           path: ${{ env.APK }}
