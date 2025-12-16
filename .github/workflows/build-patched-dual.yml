@@ -90,12 +90,25 @@ jobs:
           path: ~/.gradle
           key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', '**/gradle.properties', '**/gradle-wrapper.properties') }}
 
-      - name: Prepare signing keystore (p12)
+      - name: Prepare signing keystore (JKS)
         shell: bash
         run: |
           set -euo pipefail
-          echo "${{ secrets.SIGNING_STORE_B64 }}" | base64 -d > "$RUNNER_TEMP/signing.p12"
-          echo "KEYSTORE=$RUNNER_TEMP/signing.p12" >> $GITHUB_ENV
+          # IMPORTANT: use printf not echo (avoid newline/escape issues)
+          printf '%s' "${{ secrets.SIGNING_STORE_B64 }}" | base64 --decode > "$RUNNER_TEMP/signing.jks"
+          echo "KEYSTORE=$RUNNER_TEMP/signing.jks" >> $GITHUB_ENV
+          echo "KSTYPE=JKS" >> $GITHUB_ENV
+
+      - name: Validate keystore (fail fast)
+        shell: bash
+        run: |
+          set -euo pipefail
+          keytool -list \
+            -keystore "$KEYSTORE" \
+            -storetype "$KSTYPE" \
+            -storepass "${{ secrets.SIGNING_STORE_PASSWORD }}" \
+            -alias "${{ secrets.SIGNING_KEY_ALIAS }}" >/dev/null
+          echo "Keystore OK (alias exists)."
 
       - name: Init Gradle (project scripts)
         env:
@@ -121,7 +134,7 @@ jobs:
             ./gradlew app:assembleOssRelease
           fi
 
-      - name: Sign APKs (zipalign + apksigner) -> dist/
+      - name: Sign APKs -> dist/
         shell: bash
         run: |
           set -euo pipefail
@@ -159,6 +172,7 @@ jobs:
             "$ZIPALIGN" -p -f 4 "$apk" "$aligned"
             "$APKSIGNER" sign \
               --ks "$KEYSTORE" \
+              --ks-type "$KSTYPE" \
               --ks-key-alias "${{ secrets.SIGNING_KEY_ALIAS }}" \
               --ks-pass "pass:${{ secrets.SIGNING_STORE_PASSWORD }}" \
               --key-pass "pass:${{ secrets.SIGNING_KEY_PASSWORD }}" \
@@ -171,7 +185,6 @@ jobs:
 
           SIGNED_COUNT=0
 
-          # 1) Preview release outputs
           if [ "${{ github.event.inputs.build_preview }}" != "n" ]; then
             if [ -d "app/build/outputs/apk/preview/release" ]; then
               while IFS= read -r apk; do
@@ -184,7 +197,6 @@ jobs:
             fi
           fi
 
-          # 2) OSS stable release outputs
           if [ "${{ github.event.inputs.build_stable }}" != "n" ]; then
             if [ -d "app/build/outputs/apk/oss/release" ]; then
               while IFS= read -r apk; do
@@ -203,11 +215,9 @@ jobs:
           if [ "$SIGNED_COUNT" -eq 0 ]; then
             echo "ERROR: No APKs signed. dist is empty."
             echo "DEBUG: list app/build/outputs/apk:"
-            find app/build/outputs/apk -maxdepth 4 -type f -name "*.apk" -print || true
+            find app/build/outputs/apk -maxdepth 6 -type f -name "*.apk" -print || true
             exit 1
           fi
-
-          echo "DIST_DIR=$(pwd)/dist" >> $GITHUB_ENV
 
       - name: Upload signed APKs (artifact)
         uses: actions/upload-artifact@v4
