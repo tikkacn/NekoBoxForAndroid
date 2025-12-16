@@ -27,9 +27,8 @@ jobs:
         id: cache
         uses: actions/cache@v4
         with:
-          path: |
-            app/libs/libcore.aar
-          key: ${{ hashFiles('.github/workflows/*', 'golang_status', 'libcore_status') }}
+          path: app/libs/libcore.aar
+          key: libcore-${{ hashFiles('golang_status', 'libcore_status') }}
 
       - name: Install Golang
         if: steps.cache.outputs.cache-hit != 'true'
@@ -55,18 +54,24 @@ jobs:
           ref: patched-release
           fetch-depth: 0
 
+      # ✅ 关键：这里也要生成 status 文件，否则 cache key 为空会直接失败
+      - name: Golang Status
+        run: find buildScript libcore/*.sh | xargs cat | sha1sum > golang_status
+
+      - name: Libcore Status
+        run: git ls-files libcore | xargs cat | sha1sum > libcore_status
+
       - name: Restore LibCore Cache
         uses: actions/cache@v4
         with:
-          path: |
-            app/libs/libcore.aar
-          key: ${{ hashFiles('.github/workflows/*', 'golang_status', 'libcore_status') }}
+          path: app/libs/libcore.aar
+          key: libcore-${{ hashFiles('golang_status', 'libcore_status') }}
 
       - name: Gradle cache
         uses: actions/cache@v4
         with:
           path: ~/.gradle
-          key: gradle-oss-${{ hashFiles('**/*.gradle.kts') }}
+          key: gradle-${{ hashFiles('**/*.gradle.kts', '**/gradle-wrapper.properties') }}
 
       - name: Prepare signing keystore (PKCS12)
         shell: bash
@@ -135,7 +140,6 @@ jobs:
 
           SIGNED_COUNT=0
 
-          # 1) Preview release outputs
           if [ -d "app/build/outputs/apk/preview/release" ]; then
             while IFS= read -r apk; do
               [ -f "$apk" ] || continue
@@ -146,7 +150,6 @@ jobs:
             echo "WARN: preview/release output dir not found"
           fi
 
-          # 2) OSS stable release outputs
           if [ -d "app/build/outputs/apk/oss/release" ]; then
             while IFS= read -r apk; do
               [ -f "$apk" ] || continue
@@ -162,7 +165,6 @@ jobs:
 
           if [ "$SIGNED_COUNT" -eq 0 ]; then
             echo "ERROR: No APKs signed. dist is empty."
-            echo "DEBUG: list app/build/outputs/apk:"
             find app/build/outputs/apk -maxdepth 6 -type f -name "*.apk" -print || true
             exit 1
           fi
@@ -208,15 +210,9 @@ jobs:
           } > "${NOTES_FILE}"
 
           if gh release view "${TAG}" >/dev/null 2>&1; then
-            echo "Release exists, will upload with --clobber: ${TAG}"
+            echo "Release exists, upload with --clobber: ${TAG}"
           else
             gh release create "${TAG}" -t "${TITLE}" -F "${NOTES_FILE}"
           fi
 
           gh release upload "${TAG}" dist/*.apk --clobber
-
-      - name: Also upload as workflow artifacts (optional backup)
-        uses: actions/upload-artifact@v4
-        with:
-          name: APKs-signed
-          path: dist/*.apk
