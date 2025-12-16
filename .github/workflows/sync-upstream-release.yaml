@@ -74,16 +74,13 @@ jobs:
               if i == -1:
                   raise SystemExit(f"[FAIL] {desc}: needle not found: {needle} in {p}")
 
-              # 找到离 needle 最近的 addItem( 调用（删整块）
               call = s.rfind("addItem(", 0, i)
               if call == -1:
                   raise SystemExit(f"[FAIL] {desc}: addItem( not found before needle in {p}")
 
-              # 从该行行首开始删除（更干净）
               line_start = s.rfind("\n", 0, call)
               line_start = 0 if line_start == -1 else line_start + 1
 
-              # 从 addItem( 的 '(' 开始做括号配对，找到它对应的结尾 ')'
               open_idx = s.find("(", call)
               depth = 0
               end = None
@@ -103,20 +100,22 @@ jobs:
               write(p, new)
               print(f"[OK] {desc}")
 
-          def remove_menu_item(menu_xml: Path, item_id: str, desc: str):
-              s = read(menu_xml)
-              # 兼容多行属性 + 自闭合 <item ... />
-              pat = rf"<item\b[^>]*android:id=\"@\\+id/{re.escape(item_id)}\"[^>]*/>\s*"
-              new, n = re.subn(pat, "", s, flags=re.S)
-              if n == 0:
-                  print(f"[WARN] {desc}: not found ({item_id}) in {menu_xml}, skip")
-              else:
-                  write(menu_xml, new)
-                  print(f"[OK] {desc}")
+          def remove_menu_items_everywhere(menu_dir: Path, item_ids: list[str]):
+              if not menu_dir.exists():
+                  print(f"[WARN] menu dir not found: {menu_dir}")
+                  return
+              for xml in menu_dir.rglob("*.xml"):
+                  s = read(xml)
+                  orig = s
+                  for item_id in item_ids:
+                      pat = rf"<item\b[^>]*android:id=\"@\\+id/{re.escape(item_id)}\"[^>]*/>\s*"
+                      s = re.sub(pat, "", s, flags=re.S)
+                  if s != orig:
+                      write(xml, s)
+                      print(f"[OK] Removed menu items in {xml}")
 
           def remove_when_case_block(p: Path, rid: str, desc: str):
               s = read(p)
-              # 删除 `R.id.xxx -> { ... }` 整块（非贪婪）
               pat = rf"\s*R\.id\.{re.escape(rid)}\s*->\s*\{{.*?\}}\s*"
               new, n = re.subn(pat, "", s, flags=re.S)
               if n == 0:
@@ -134,14 +133,15 @@ jobs:
                   write(p, new)
                   print(f"[OK] {desc}")
 
-          # 1) AboutFragment：删 donate 对应的 addItem(...) 整块（不依赖具体结构）
+          # 1) AboutFragment：删 donate 块
           about = Path("app/src/main/java/io/nekohasekai/sagernet/ui/AboutFragment.kt")
           remove_additem_block_containing(about, "R.string.donate", "Remove donate item in AboutFragment")
 
-          # 2) drawer 菜单：删 推广/文档 两项
-          menu = Path("app/src/main/res/menu/main_drawer_menu.xml")
-          remove_menu_item(menu, "nav_tuiguang", "Remove nav_tuiguang from drawer menu")
-          remove_menu_item(menu, "nav_faq", "Remove nav_faq from drawer menu")
+          # 2) drawer 菜单：在所有 res/menu 里删 nav_tuiguang/nav_faq
+          remove_menu_items_everywhere(
+              Path("app/src/main/res/menu"),
+              ["nav_tuiguang", "nav_faq"]
+          )
 
           # 3) MainActivity：删处理分支 + 可见性控制行
           main = Path("app/src/main/java/io/nekohasekai/sagernet/ui/MainActivity.kt")
@@ -155,7 +155,10 @@ jobs:
           PY
           # ============================================
 
-          # 记录同步到的 release tag（用于下次对比，避免无意义编译）
+          # 关键：patched-release 不允许由 GITHUB_TOKEN 推送/更新 workflow 文件，直接删掉
+          rm -rf .github/workflows || true
+
+          # 记录同步到的 release tag（用于下次对比）
           echo "$TAG" > .upstream_release_tag
 
           git config user.name "github-actions[bot]"
