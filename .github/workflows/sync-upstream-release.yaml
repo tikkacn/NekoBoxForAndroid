@@ -8,7 +8,7 @@ on:
         required: false
         default: "false"
   schedule:
-    - cron: "0 */6 * * *" # 每6小时检查一次；想更省就改成每天一次：0 3 * * *
+    - cron: "0 */6 * * *"
 
 permissions:
   contents: write
@@ -59,10 +59,10 @@ jobs:
           TAG="${{ steps.upstream.outputs.tag }}"
           echo "Syncing to tag: $TAG"
 
-          # 让 patched-release 变成“上游发布版源码”
+          # patched-release 先完全对齐上游 tag（重要：自动“修复”之前删坏的 MainActivity）
           git reset --hard "refs/tags/$TAG"
 
-          # ====== 自动应用你的 UI 改动（稳健版）======
+          # ====== 应用你的 UI 改动：只隐藏菜单 + 删除 About donate ======
           python3 - <<'PY'
           import re
           from pathlib import Path
@@ -105,110 +105,61 @@ jobs:
               write(p, new)
               print(f"[OK] {desc}")
 
-          def remove_menu_items_everywhere(menu_dir: Path, item_ids: list[str]):
+          def hide_menu_item(menu_dir: Path, item_id: str):
               if not menu_dir.exists():
                   print(f"[WARN] menu dir not found: {menu_dir}")
                   return
+
+              found_any = False
               for xml in menu_dir.rglob("*.xml"):
                   s = read(xml)
-                  orig = s
-                  for item_id in item_ids:
-                      pat = rf"<item\b[^>]*android:id=\"@\\+id/{re.escape(item_id)}\"[^>]*/>\s*"
-                      s = re.sub(pat, "", s, flags=re.S)
-                  if s != orig:
-                      write(xml, s)
-                      print(f"[OK] Removed menu items in {xml}")
+                  # 找到包含该 id 的 <item ...> 标签（自闭合/非自闭合都处理）
+                  # 如果已经有 android:visible 就不改
+                  def repl(m):
+                      nonlocal found_any
+                      tag = m.group(0)
+                      if "android:visible=" in tag:
+                          found_any = True
+                          return tag
+                      found_any = True
+                      # 在 <item 后插入属性最稳
+                      return tag.replace("<item", '<item android:visible="false"', 1)
 
-          # 关键修复：按 { } 配对删除 when case，避免正则删坏 Kotlin
-          def remove_when_case_block_by_braces(p: Path, rid: str, desc: str):
-              s = read(p)
-              key = f"R.id.{rid}"
-              i = s.find(key)
-              if i == -1:
-                  print(f"[WARN] {desc}: not found ({key}) in {p}, skip")
-                  return
+                  new = re.sub(
+                      rf"<item\b[^>]*android:id=\"@\+id/{re.escape(item_id)}\"[^>]*?/?>",
+                      repl,
+                      s,
+                      flags=re.S,
+                  )
+                  if new != s:
+                      write(xml, new)
+                      print(f"[OK] Hide {item_id} in {xml}")
 
-              line_start = s.rfind("\n", 0, i)
-              line_start = 0 if line_start == -1 else line_start + 1
+              if not found_any:
+                  print(f"[WARN] Menu item id not found anywhere: {item_id}")
 
-              arrow = s.find("->", i)
-              if arrow == -1:
-                  raise SystemExit(f"[FAIL] {desc}: '->' not found after {key} in {p}")
-
-              brace = s.find("{", arrow)
-              if brace == -1:
-                  # 罕见情况：没用大括号包裹，直接删到行尾
-                  line_end = s.find("\n", arrow)
-                  line_end = len(s) if line_end == -1 else line_end + 1
-                  new = s[:line_start] + s[line_end:]
-                  write(p, new)
-                  print(f"[OK] {desc} (line form)")
-                  return
-
-              depth = 0
-              end = None
-              for j in range(brace, len(s)):
-                  c = s[j]
-                  if c == "{":
-                      depth += 1
-                  elif c == "}":
-                      depth -= 1
-                      if depth == 0:
-                          end = j + 1
-                          break
-              if end is None:
-                  raise SystemExit(f"[FAIL] {desc}: cannot match braces for {key} in {p}")
-
-              # 吃掉一点尾部空白/换行，避免留下奇怪空行
-              while end < len(s) and s[end] in " \t\r\n":
-                  if s[end] == "\n":
-                      end += 1
-                      break
-                  end += 1
-
-              new = s[:line_start] + s[end:]
-              write(p, new)
-              print(f"[OK] {desc}")
-
-          def remove_line_by_regex(p: Path, pat: str, desc: str):
-              s = read(p)
-              new, n = re.subn(pat, "", s, flags=re.M)
-              if n == 0:
-                  print(f"[WARN] {desc}: line not found in {p}, skip")
-              else:
-                  write(p, new)
-                  print(f"[OK] {desc}")
-
-          # 1) AboutFragment：删 donate 块
+          # 1) About：删 donate item
           about = Path("app/src/main/java/io/nekohasekai/sagernet/ui/AboutFragment.kt")
           remove_additem_block_containing(about, "R.string.donate", "Remove donate item in AboutFragment")
 
-          # 2) drawer 菜单：在所有 res/menu 里删 nav_tuiguang/nav_faq（若上游换id会 WARN，不影响编译）
-          remove_menu_items_everywhere(Path("app/src/main/res/menu"), ["nav_tuiguang", "nav_faq"])
+          # 2) 侧边栏菜单：隐藏（不删除，避免 R.id 消失导致编译/逻辑出问题）
+          menu_dir = Path("app/src/main/res/menu")
+          hide_menu_item(menu_dir, "nav_tuiguang")
+          hide_menu_item(menu_dir, "nav_faq")
 
-          # 3) MainActivity：删处理分支 + 可见性控制行（这里用括号配对，最稳）
-          main = Path("app/src/main/java/io/nekohasekai/sagernet/ui/MainActivity.kt")
-          remove_when_case_block_by_braces(main, "nav_faq", "Remove nav_faq handler block")
-          remove_when_case_block_by_braces(main, "nav_tuiguang", "Remove nav_tuiguang handler block")
-          remove_line_by_regex(
-              main,
-              r"^[ \t]*navigation\.menu\.findItem\(R\.id\.nav_tuiguang\)\?\.[^\n]*\n",
-              "Remove nav_tuiguang visibility line"
-          )
           PY
-          # ============================================
+          # ============================================================
 
-          # 关键：patched-release 不允许由 GITHUB_TOKEN 推送/更新 workflow 文件，直接删掉
+          # 关键：patched-release 分支不要包含 workflows（否则 push 会被拒）
           rm -rf .github/workflows || true
 
-          # 记录同步到的 release tag（用于下次对比）
+          # 记录这次同步到的 tag
           echo "$TAG" > .upstream_release_tag
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           git commit -m "Sync upstream release $TAG + apply UI patches" || true
-
           git push --force-with-lease origin HEAD:patched-release
 
       - name: Trigger build workflow (only when updated)
