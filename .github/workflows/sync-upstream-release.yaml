@@ -1,13 +1,9 @@
-name: Sync Upstream Release (Only When Updated)
+name: Sync Upstream Release (apply UI patches)
 
 on:
   workflow_dispatch:
-    inputs:
-      force:
-        description: "Force re-sync & re-apply patches even if tag unchanged"
-        required: false
-        default: "false"
   schedule:
+    # 每6小时检查一次上游是否发了新 Release；没更新就快速退出，不会浪费编译时间
     - cron: "0 */6 * * *"
 
 permissions:
@@ -17,6 +13,7 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout patched-release
         uses: actions/checkout@v4
@@ -24,182 +21,267 @@ jobs:
           ref: patched-release
           fetch-depth: 0
 
-      - name: Get upstream latest release tag
+      - name: Git config
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Read upstream latest release tag
         id: upstream
         run: |
           set -e
-          TAG=$(curl -s https://api.github.com/repos/MatsuriDayo/NekoBoxForAndroid/releases/latest | jq -r .tag_name)
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          TAG=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/MatsuriDayo/NekoBoxForAndroid/releases/latest \
+            | jq -r .tag_name)
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "Failed to get upstream tag_name."
+            exit 1
+          fi
+          echo "UPSTREAM_TAG=$TAG" >> $GITHUB_ENV
           echo "Upstream latest tag: $TAG"
 
       - name: Read current synced tag (from patched-release)
         id: current
         run: |
           set -e
+          CUR=""
           if [ -f .upstream_release_tag ]; then
-            CUR=$(cat .upstream_release_tag)
-          else
-            CUR=""
+            CUR=$(cat .upstream_release_tag | tr -d '\r\n\t ')
           fi
-          echo "tag=$CUR" >> $GITHUB_OUTPUT
-          echo "Current tag: $CUR"
+          echo "CURRENT_TAG=$CUR" >> $GITHUB_ENV
+          echo "Current synced tag: $CUR"
 
       - name: Exit if no update
-        if: steps.upstream.outputs.tag == steps.current.outputs.tag && inputs.force != 'true'
-        run: echo "No new upstream release tag. Skip sync & build."
-
-      - name: Sync upstream tag -> patched-release, then apply UI changes
-        if: steps.upstream.outputs.tag != steps.current.outputs.tag || inputs.force == 'true'
         run: |
           set -e
+          if [ "${UPSTREAM_TAG}" = "${CURRENT_TAG}" ]; then
+            echo "No upstream update. Exit."
+            exit 0
+          fi
+          echo "Upstream updated: ${CURRENT_TAG} -> ${UPSTREAM_TAG}"
 
-          git remote add upstream https://github.com/MatsuriDayo/NekoBoxForAndroid.git || true
+      - name: Backup workflows (keep ours)
+        run: |
+          set -e
+          mkdir -p /tmp/keep_workflows
+          if [ -d .github/workflows ]; then
+            tar -czf /tmp/keep_workflows/workflows.tgz .github/workflows
+            echo "Backed up .github/workflows"
+          else
+            echo "No .github/workflows to backup"
+          fi
+
+      - name: Add upstream remote & fetch tags
+        run: |
+          set -e
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/MatsuriDayo/NekoBoxForAndroid.git
           git fetch upstream --tags --force
 
-          TAG="${{ steps.upstream.outputs.tag }}"
-          echo "Syncing to tag: $TAG"
+      - name: Sync upstream tag -> patched-release (hard reset), then restore workflows
+        run: |
+          set -e
+          # 把 patched-release 强制对齐到上游 tag
+          git reset --hard "refs/tags/${UPSTREAM_TAG}"
 
-          git reset --hard "refs/tags/$TAG"
+          # 还原我们自己的 workflows（避免被上游覆盖，且避免触发 workflow 权限相关 push 问题）
+          if [ -f /tmp/keep_workflows/workflows.tgz ]; then
+            rm -rf .github/workflows || true
+            tar -xzf /tmp/keep_workflows/workflows.tgz
+            echo "Restored .github/workflows"
+          fi
 
-          python3 - <<'PY'
-          import re
-          from pathlib import Path
+      - name: Apply UI patches (About donate + hide nav items + remove handlers)
+        run: |
+          set -e
+          python3 - << 'PY'
+          import os, re, sys
 
-          def read(p: Path) -> str:
-              return p.read_text(encoding="utf-8")
+          def read(path):
+            with open(path, "r", encoding="utf-8") as f:
+              return f.read()
 
-          def write(p: Path, s: str):
-              p.write_text(s, encoding="utf-8")
+          def write(path, s):
+            with open(path, "w", encoding="utf-8") as f:
+              f.write(s)
 
-          def remove_additem_block_containing(p: Path, needle: str, desc: str):
-              s = read(p)
-              i = s.find(needle)
-              if i == -1:
-                  raise SystemExit(f"[FAIL] {desc}: needle not found: {needle} in {p}")
+          def info(msg): print(msg)
+          def warn(msg): print("[WARN]", msg)
+          def ok(msg): print("[OK]", msg)
 
-              call = s.rfind("addItem(", 0, i)
-              if call == -1:
-                  raise SystemExit(f"[FAIL] {desc}: addItem( not found before needle in {p}")
+          # -------- Patch 1: AboutFragment remove donate item --------
+          about_path = "app/src/main/java/io/nekohasekai/sagernet/ui/AboutFragment.kt"
+          if os.path.exists(about_path):
+            s = read(about_path)
+            before = s
 
-              line_start = s.rfind("\n", 0, call)
-              line_start = 0 if line_start == -1 else line_start + 1
+            # 删除包含 .text(R.string.donate) 的 addItem(...) 块（尽量宽松匹配）
+            # 常见结构：.addItem( MaterialAboutActionItem.Builder() ... .text(R.string.donate) ... .build())
+            pattern = re.compile(
+              r"""\.addItem\(\s*MaterialAboutActionItem\.Builder\(\)\s*
+                  (?:.|\n)*?\.text\(\s*R\.string\.donate\s*\)\s*
+                  (?:.|\n)*?\.build\(\)\s*\)\s*""",
+              re.X
+            )
+            s2, n = pattern.subn("", s, count=1)
+            if n == 0:
+              # 兼容另一种写法：.icon(...)\n.text(R.string.donate)\n... .build())
+              pattern2 = re.compile(
+                r"""\.addItem\(\s*
+                    (?:.|\n)*?R\.string\.donate
+                    (?:.|\n)*?\.build\(\)\s*\)\s*""",
+                re.X
+              )
+              s2, n = pattern2.subn("", s, count=1)
 
-              open_idx = s.find("(", call)
-              depth = 0
-              end = None
-              for j in range(open_idx, len(s)):
-                  c = s[j]
-                  if c == "(":
-                      depth += 1
-                  elif c == ")":
-                      depth -= 1
-                      if depth == 0:
-                          end = j + 1
-                          break
-              if end is None:
-                  raise SystemExit(f"[FAIL] {desc}: cannot find matching ')' for addItem( in {p}")
-
-              new = s[:line_start] + s[end:]
-              write(p, new)
-              print(f"[OK] {desc}")
-
-          def hide_menu_items_by_id(menu_dir: Path, item_ids: list[str]):
-              if not menu_dir.exists():
-                  print(f"[WARN] menu dir not found: {menu_dir}")
-                  return
-
-              for item_id in item_ids:
-                  found_any = False
-                  for xml in menu_dir.rglob("*.xml"):
-                      s = read(xml)
-
-                      def repl(m):
-                          nonlocal found_any
-                          tag = m.group(0)
-                          if "android:visible=" in tag:
-                              found_any = True
-                              return tag
-                          found_any = True
-                          return tag.replace("<item", '<item android:visible="false"', 1)
-
-                      new = re.sub(
-                          rf"<item\b[^>]*android:id=\"@\+id/{re.escape(item_id)}\"[^>]*?/?>",
-                          repl,
-                          s,
-                          flags=re.S,
-                      )
-                      if new != s:
-                          write(xml, new)
-                          print(f"[OK] Hide {item_id} in {xml}")
-
-                  if not found_any:
-                      print(f"[WARN] Menu item id not found anywhere: {item_id}")
-
-          def force_disable_nav_tuiguang_in_mainactivity(p: Path):
-              s = read(p)
-              old = "navigation.menu.findItem(R.id.nav_tuiguang)?.isVisible = !isPlay"
-              new = "navigation.menu.findItem(R.id.nav_tuiguang)?.isVisible = false"
-              if old in s:
-                  write(p, s.replace(old, new))
-                  print("[OK] Force nav_tuiguang visibility to false in MainActivity")
-                  return
-
-              # 兜底：允许不同空格/换行写法
-              pat = r'navigation\.menu\.findItem\(R\.id\.nav_tuiguang\)\?\.\s*isVisible\s*=\s*!isPlay'
-              s2, n = re.subn(pat, new, s)
-              if n > 0:
-                  write(p, s2)
-                  print("[OK] Force nav_tuiguang visibility to false in MainActivity (regex)")
-              else:
-                  print("[WARN] MainActivity nav_tuiguang visibility line not found; skip")
-
-          # 1) About：删 donate
-          about = Path("app/src/main/java/io/nekohasekai/sagernet/ui/AboutFragment.kt")
-          remove_additem_block_containing(about, "R.string.donate", "Remove donate item in AboutFragment")
-
-          # 2) menu：隐藏推广/文档
-          menu_dir = Path("app/src/main/res/menu")
-          hide_menu_items_by_id(menu_dir, ["nav_tuiguang", "nav_faq"])
-
-          # 3) MainActivity：禁止运行时把“推广”强制显示出来
-          main = Path("app/src/main/java/io/nekohasekai/sagernet/ui/MainActivity.kt")
-          if main.exists():
-              force_disable_nav_tuiguang_in_mainactivity(main)
+            if n > 0:
+              write(about_path, s2)
+              ok("Remove donate item in AboutFragment")
+            else:
+              warn(f"Remove donate item in AboutFragment: pattern not found, skip ({about_path})")
           else:
-              print("[WARN] MainActivity.kt not found, skip")
+            warn(f"AboutFragment not found: {about_path}")
 
-          # DEBUG：打印所有 menu item id
-          try:
-              ids = []
-              for xml in menu_dir.rglob("*.xml"):
-                  s = read(xml)
-                  for m in re.finditer(r'android:id="@\+id/([^"]+)"', s):
-                      ids.append((m.group(1), str(xml)))
-              print("[DEBUG] menu item ids:")
-              for item_id, xml in ids:
-                  print(f"  - {item_id}  ({xml})")
-          except Exception as e:
-              print("[DEBUG] scan menu ids failed:", e)
+          # -------- Patch 2: Hide drawer menu items (nav_tuiguang & nav_faq) --------
+          menu_path = "app/src/main/res/menu/main_drawer_menu.xml"
+          if os.path.exists(menu_path):
+            s = read(menu_path)
+
+            def hide_item(xml: str, item_id: str):
+              # 给对应 <item ... android:id="@+id/xxx" ...> 增加 android:visible="false"
+              # 如果已存在 android:visible 则改成 false
+              # 这里用“单个 <item ... />”的匹配（该文件就是这种结构）
+              pat = re.compile(rf'(<item\b[^>]*\bandroid:id="@\+id/{re.escape(item_id)}"[^>]*)(/?>)', re.M)
+              m = pat.search(xml)
+              if not m:
+                return xml, False, f"not found ({item_id})"
+              head, tail = m.group(1), m.group(2)
+
+              if 'android:visible=' in head:
+                head2 = re.sub(r'android:visible="[^"]*"', 'android:visible="false"', head)
+              else:
+                head2 = head + '\n            android:visible="false"'
+              xml2 = xml[:m.start()] + head2 + tail + xml[m.end():]
+              return xml2, True, "ok"
+
+            changed_any = False
+            for item in ("nav_tuiguang", "nav_faq"):
+              s2, changed, msg = hide_item(s, item)
+              if changed:
+                s = s2
+                changed_any = True
+                ok(f'Hide {item} in {menu_path}')
+              else:
+                warn(f'Hide {item} in {menu_path}: {msg}, skip')
+
+            if changed_any:
+              write(menu_path, s)
+          else:
+            warn(f"Drawer menu xml not found: {menu_path}")
+
+          # -------- Patch 3: MainActivity - force hide + remove click handler blocks --------
+          main_path = "app/src/main/java/io/nekohasekai/sagernet/ui/MainActivity.kt"
+          if os.path.exists(main_path):
+            s = read(main_path)
+            orig = s
+
+            # 3.1 强制隐藏（把任何对 nav_tuiguang 的 isVisible 赋值改成 false）
+            s, n1 = re.subn(
+              r'(navigation\.menu\.findItem\(R\.id\.nav_tuiguang\)\?\.(?:isVisible|setVisible)\s*=\s*).*$',
+              r'\1false',
+              s,
+              flags=re.M
+            )
+
+            # 3.2 如果没有 nav_faq 隐藏行，补一行（放在 nav_tuiguang 隐藏行后面或合适位置）
+            if "R.id.nav_faq" not in s or "findItem(R.id.nav_faq)?.isVisible" not in s:
+              # 尝试在 nav_tuiguang 行之后插入
+              pat_insert = re.compile(r'(navigation\.menu\.findItem\(R\.id\.nav_tuiguang\)\?\.(?:isVisible|setVisible)\s*=\s*false\s*\n)')
+              if pat_insert.search(s):
+                s = pat_insert.sub(r'\1        navigation.menu.findItem(R.id.nav_faq)?.isVisible = false\n', s, count=1)
+                ok("Add hide line for nav_faq")
+              else:
+                # 找不到位置就不强插，避免破坏结构
+                warn("Could not find nav_tuiguang hide line to insert nav_faq hide; skip insert")
+
+            # 3.3 删除 when(id) 中的 nav_faq/nav_tuiguang 处理块（宽松：只要是 `R.id.xxx -> { ... }` 这种结构）
+            def remove_when_case(code: str, case_id: str):
+              key = f"R.id.{case_id} -> {{"
+              idx = code.find(key)
+              if idx == -1:
+                return code, False
+              # 从 idx 开始，找到匹配的大括号结束位置
+              i = idx + len(key)
+              depth = 1
+              while i < len(code) and depth > 0:
+                if code[i] == "{":
+                  depth += 1
+                elif code[i] == "}":
+                  depth -= 1
+                i += 1
+              # i 现在在 case 块结尾的 '}' 后面，继续吃掉可能的空白/换行
+              j = i
+              while j < len(code) and code[j] in " \t\r\n":
+                j += 1
+              # 删除整个 case 块（含前导缩进保留：从 idx 往前吃掉本行缩进）
+              line_start = code.rfind("\n", 0, idx)
+              if line_start != -1:
+                # 如果前面是换行，从换行后开始删
+                start = line_start + 1
+              else:
+                start = idx
+              return code[:start] + code[j:], True
+
+            s, rm1 = remove_when_case(s, "nav_faq")
+            if rm1:
+              ok("Remove nav_faq handler block")
+            else:
+              warn("Remove nav_faq handler block: not found, skip")
+
+            s, rm2 = remove_when_case(s, "nav_tuiguang")
+            if rm2:
+              ok("Remove nav_tuiguang handler block")
+            else:
+              warn("Remove nav_tuiguang handler block: not found, skip")
+
+            if s != orig:
+              write(main_path, s)
+          else:
+            warn(f"MainActivity not found: {main_path}")
 
           PY
 
-          # patched-release 分支不要带 workflows
-          rm -rf .github/workflows || true
-          echo "$TAG" > .upstream_release_tag
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "Sync upstream release $TAG + apply UI patches" || true
-          git push --force-with-lease origin HEAD:patched-release
-
-      - name: Trigger build workflow (only when updated)
-        if: steps.upstream.outputs.tag != steps.current.outputs.tag || inputs.force == 'true'
+      - name: Record synced tag
         run: |
           set -e
-          curl -s -X POST \
+          echo "${UPSTREAM_TAG}" > .upstream_release_tag
+
+      - name: Commit changes (if any)
+        run: |
+          set -e
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Sync upstream release ${UPSTREAM_TAG} + apply UI patches"
+
+      - name: Push patched-release
+        run: |
+          set -e
+          # 我们 reset 到 tag，所以通常需要 force 更新分支
+          git push origin HEAD:patched-release --force-with-lease
+
+      - name: Trigger build workflow (only when updated)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          # 触发你仓库里的 build-patched-release.yml（ref 固定 patched-release）
+          curl -fsSL -X POST \
             -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
             https://api.github.com/repos/${{ github.repository }}/actions/workflows/build-patched-release.yml/dispatches \
-            -d '{"ref":"main"}' >/dev/null
+            -d "{\"ref\":\"patched-release\"}" >/dev/null
           echo "Build workflow dispatched."
