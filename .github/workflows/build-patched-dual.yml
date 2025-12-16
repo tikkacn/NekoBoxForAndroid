@@ -1,42 +1,17 @@
-name: Build Patched Dual (Preview + Stable, Signed)
+name: Build Patched Dual (Signed)
 
 on:
   workflow_dispatch:
-    inputs:
-      target_ref:
-        description: "Code branch to build (should contain your UI patches)"
-        required: false
-        default: "patched-release"
-      publish_release:
-        description: "Publish GitHub Release? (y/n)"
-        required: false
-        default: "n"
-      release_tag:
-        description: "Override release tag (leave empty for auto)"
-        required: false
-        default: ""
-      build_preview:
-        description: "Build PreviewRelease? (y/n)"
-        required: false
-        default: "y"
-      build_stable:
-        description: "Build OssRelease (stable)? (y/n)"
-        required: false
-        default: "y"
-
-permissions:
-  contents: write
 
 jobs:
   libcore:
     name: Native Build (LibCore)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout target branch
+      - name: Checkout patched-release
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.target_ref }}
-          fetch-depth: 0
+          ref: patched-release
 
       - name: Golang Status
         run: find buildScript libcore/*.sh | xargs cat | sha1sum > golang_status
@@ -49,7 +24,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: app/libs/libcore.aar
-          key: libcore-${{ runner.os }}-${{ hashFiles('.github/workflows/*', 'golang_status', 'libcore_status') }}
+          key: ${{ hashFiles('.github/workflows/*', 'golang_status', 'libcore_status') }}
 
       - name: Install Golang
         if: steps.cache.outputs.cache-hit != 'true'
@@ -65,148 +40,131 @@ jobs:
     name: Build Dual APKs (Signed)
     runs-on: ubuntu-latest
     needs: [libcore]
+    env:
+      TZ: Asia/Shanghai
+      BUILD_PLUGIN: none
+
+      # ====== SIGNING (match your repo secrets) ======
+      KSTYPE: JKS
+      KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_B64 }}
+      STORE_PASS: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+      KEY_PASS: ${{ secrets.SIGNING_KEY_PASSWORD }}
+
     steps:
-      - name: Checkout target branch
+      - name: Checkout patched-release
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.target_ref }}
-          fetch-depth: 0
+          ref: patched-release
 
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
+      - name: Golang Status
+        run: find buildScript libcore/*.sh | xargs cat | sha1sum > golang_status
 
-      - name: Restore LibCore Cache
+      - name: Libcore Status
+        run: git ls-files libcore | xargs cat | sha1sum > libcore_status
+
+      - name: LibCore Cache
         uses: actions/cache@v4
         with:
           path: app/libs/libcore.aar
-          key: libcore-${{ runner.os }}-${{ hashFiles('.github/workflows/*', 'golang_status', 'libcore_status') }}
+          key: ${{ hashFiles('.github/workflows/*', 'golang_status', 'libcore_status') }}
 
       - name: Gradle cache
         uses: actions/cache@v4
         with:
           path: ~/.gradle
-          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', '**/gradle.properties', '**/gradle-wrapper.properties') }}
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts') }}
 
       - name: Prepare signing keystore (JKS)
         shell: bash
         run: |
           set -euo pipefail
-          # IMPORTANT: use printf not echo (avoid newline/escape issues)
-          printf '%s' "${{ secrets.SIGNING_STORE_B64 }}" | base64 --decode > "$RUNNER_TEMP/signing.jks"
-          echo "KEYSTORE=$RUNNER_TEMP/signing.jks" >> $GITHUB_ENV
-          echo "KSTYPE=JKS" >> $GITHUB_ENV
+          [ -n "${KEYSTORE_B64}" ] || (echo "ERROR: SIGNING_KEYSTORE_B64 is empty" && exit 1)
+          [ -n "${STORE_PASS}" ]  || (echo "ERROR: SIGNING_KEYSTORE_PASSWORD is empty" && exit 1)
+          [ -n "${KEY_ALIAS}" ]   || (echo "ERROR: SIGNING_KEY_ALIAS is empty" && exit 1)
+          [ -n "${KEY_PASS}" ]    || (echo "ERROR: SIGNING_KEY_PASSWORD is empty" && exit 1)
+
+          KEYSTORE="${RUNNER_TEMP}/signing.jks"
+          printf '%s' "${KEYSTORE_B64}" | tr -d '\r\n' | base64 -d > "${KEYSTORE}"
+          echo "KEYSTORE=${KEYSTORE}" >> $GITHUB_ENV
+          ls -lah "${KEYSTORE}"
 
       - name: Validate keystore (fail fast)
         shell: bash
         run: |
           set -euo pipefail
           keytool -list \
-            -keystore "$KEYSTORE" \
-            -storetype "$KSTYPE" \
-            -storepass "${{ secrets.SIGNING_STORE_PASSWORD }}" \
-            -alias "${{ secrets.SIGNING_KEY_ALIAS }}" >/dev/null
+            -keystore "${KEYSTORE}" \
+            -storetype "${KSTYPE}" \
+            -storepass "${STORE_PASS}" \
+            -alias "${KEY_ALIAS}" >/dev/null
           echo "Keystore OK (alias exists)."
 
       - name: Init Gradle (project scripts)
-        env:
-          BUILD_PLUGIN: none
         shell: bash
         run: |
           set -euo pipefail
           echo "sdk.dir=${ANDROID_HOME}" > local.properties
           echo "ndk.dir=${ANDROID_HOME}/ndk/25.0.8775105" >> local.properties
-          export LOCAL_PROPERTIES="${{ secrets.LOCAL_PROPERTIES }}"
           ./run init action gradle
 
-      - name: Build (PreviewRelease / OssRelease)
-        env:
-          BUILD_PLUGIN: none
+      - name: Build (PreviewRelease + OssRelease)
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ github.event.inputs.build_preview }}" != "n" ]; then
-            ./gradlew app:assemblePreviewRelease
-          fi
-          if [ "${{ github.event.inputs.build_stable }}" != "n" ]; then
-            ./gradlew app:assembleOssRelease
-          fi
+          ./gradlew app:assemblePreviewRelease app:assembleOssRelease
 
       - name: Sign APKs -> dist/
         shell: bash
         run: |
           set -euo pipefail
-
-          BT="$(ls -d ${ANDROID_HOME}/build-tools/* | sort -V | tail -n 1)"
-          ZIPALIGN="$BT/zipalign"
-          APKSIGNER="$BT/apksigner"
-          echo "Using build-tools: $BT"
-
-          UPSTREAM_TAG="unknown"
-          if [ -f ".upstream_release_tag" ]; then
-            UPSTREAM_TAG="$(cat .upstream_release_tag | tr -d ' \r\n')"
-          fi
-          TS="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M)"
-          AUTO_TAG="patched-${UPSTREAM_TAG}+build-${TS}"
-
-          FINAL_TAG="${{ github.event.inputs.release_tag }}"
-          if [ -z "$FINAL_TAG" ]; then
-            FINAL_TAG="$AUTO_TAG"
-          fi
-
-          echo "UPSTREAM_TAG=$UPSTREAM_TAG" >> $GITHUB_ENV
-          echo "BUILD_TS=$TS" >> $GITHUB_ENV
-          echo "RELEASE_TAG=$FINAL_TAG" >> $GITHUB_ENV
-
           mkdir -p dist
 
-          sign_one () {
-            local apk="$1"
-            local base="$(basename "$apk")"
-            local aligned="dist/${FINAL_TAG}--${base%.apk}--aligned.apk"
-            local signed="dist/${FINAL_TAG}--${base%.apk}--SIGNED.apk"
+          BUILD_TOOLS="$(ls -d ${ANDROID_HOME}/build-tools/* | sort -V | tail -n 1)"
+          APKSIGNER="${BUILD_TOOLS}/apksigner"
+          echo "Using build-tools: ${BUILD_TOOLS}"
 
-            echo "Signing: $apk"
-            "$ZIPALIGN" -p -f 4 "$apk" "$aligned"
-            "$APKSIGNER" sign \
-              --ks "$KEYSTORE" \
-              --ks-type "$KSTYPE" \
-              --ks-key-alias "${{ secrets.SIGNING_KEY_ALIAS }}" \
-              --ks-pass "pass:${{ secrets.SIGNING_STORE_PASSWORD }}" \
-              --key-pass "pass:${{ secrets.SIGNING_KEY_PASSWORD }}" \
-              --out "$signed" \
-              "$aligned"
-            "$APKSIGNER" verify --verbose "$signed"
-            rm -f "$aligned"
-            echo "OK: $signed"
+          sign_one () {
+            local in_apk="$1"
+            local base="$(basename "$in_apk")"
+            local out_apk="dist/${base/-unsigned/}"
+            if [ "$out_apk" = "dist/${base}" ]; then
+              out_apk="dist/signed-${base}"
+            fi
+
+            "${APKSIGNER}" sign \
+              --ks "${KEYSTORE}" \
+              --ks-type "${KSTYPE}" \
+              --ks-key-alias "${KEY_ALIAS}" \
+              --ks-pass "pass:${STORE_PASS}" \
+              --key-pass "pass:${KEY_PASS}" \
+              --out "${out_apk}" \
+              "${in_apk}"
+
+            "${APKSIGNER}" verify --verbose "${out_apk}" >/dev/null
+            echo "SIGNED: ${out_apk}"
           }
 
           SIGNED_COUNT=0
 
-          if [ "${{ github.event.inputs.build_preview }}" != "n" ]; then
-            if [ -d "app/build/outputs/apk/preview/release" ]; then
-              while IFS= read -r apk; do
-                [ -f "$apk" ] || continue
-                sign_one "$apk"
-                SIGNED_COUNT=$((SIGNED_COUNT+1))
-              done < <(find app/build/outputs/apk/preview/release -type f -name "*.apk" | sort)
-            else
-              echo "WARN: preview/release output dir not found"
-            fi
+          if [ -d "app/build/outputs/apk/preview/release" ]; then
+            while IFS= read -r apk; do
+              [ -f "$apk" ] || continue
+              sign_one "$apk"
+              SIGNED_COUNT=$((SIGNED_COUNT+1))
+            done < <(find app/build/outputs/apk/preview/release -type f -name "*.apk" | sort)
+          else
+            echo "WARN: preview/release output dir not found"
           fi
 
-          if [ "${{ github.event.inputs.build_stable }}" != "n" ]; then
-            if [ -d "app/build/outputs/apk/oss/release" ]; then
-              while IFS= read -r apk; do
-                [ -f "$apk" ] || continue
-                sign_one "$apk"
-                SIGNED_COUNT=$((SIGNED_COUNT+1))
-              done < <(find app/build/outputs/apk/oss/release -type f -name "*.apk" | sort)
-            else
-              echo "WARN: oss/release output dir not found"
-            fi
+          if [ -d "app/build/outputs/apk/oss/release" ]; then
+            while IFS= read -r apk; do
+              [ -f "$apk" ] || continue
+              sign_one "$apk"
+              SIGNED_COUNT=$((SIGNED_COUNT+1))
+            done < <(find app/build/outputs/apk/oss/release -type f -name "*.apk" | sort)
+          else
+            echo "WARN: oss/release output dir not found"
           fi
 
           echo "Signed count = $SIGNED_COUNT"
@@ -214,24 +172,12 @@ jobs:
 
           if [ "$SIGNED_COUNT" -eq 0 ]; then
             echo "ERROR: No APKs signed. dist is empty."
-            echo "DEBUG: list app/build/outputs/apk:"
             find app/build/outputs/apk -maxdepth 6 -type f -name "*.apk" -print || true
             exit 1
           fi
 
-      - name: Upload signed APKs (artifact)
+      - name: Upload signed APKs
         uses: actions/upload-artifact@v4
         with:
-          name: APKs-${{ env.RELEASE_TAG }}
+          name: signed-apks
           path: dist/*.apk
-
-      - name: Publish GitHub Release (optional)
-        if: ${{ github.event.inputs.publish_release == 'y' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          gh release create "${RELEASE_TAG}" dist/*.apk \
-            --title "${RELEASE_TAG}" \
-            --notes "Upstream: ${UPSTREAM_TAG}\nBuild time (Asia/Shanghai): ${BUILD_TS}\nBranch: ${{ github.event.inputs.target_ref }}"
