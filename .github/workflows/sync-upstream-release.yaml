@@ -59,10 +59,8 @@ jobs:
           TAG="${{ steps.upstream.outputs.tag }}"
           echo "Syncing to tag: $TAG"
 
-          # patched-release 先完全对齐上游 tag（用于修复任何历史误改）
           git reset --hard "refs/tags/$TAG"
 
-          # ====== 应用你的 UI 改动：隐藏菜单 + 删除 About donate ======
           python3 - <<'PY'
           import re
           from pathlib import Path
@@ -114,7 +112,7 @@ jobs:
                   found_any = False
                   for xml in menu_dir.rglob("*.xml"):
                       s = read(xml)
-                      # 命中含 id 的 <item ...> 标签（自闭合/非自闭合都可以）
+
                       def repl(m):
                           nonlocal found_any
                           tag = m.group(0)
@@ -137,52 +135,40 @@ jobs:
                   if not found_any:
                       print(f"[WARN] Menu item id not found anywhere: {item_id}")
 
-          def hide_menu_items_by_title(menu_dir: Path, title_value: str, label: str):
-              """
-              title_value 例子：@string/ads
-              """
-              if not menu_dir.exists():
-                  print(f"[WARN] menu dir not found: {menu_dir}")
+          def force_disable_nav_tuiguang_in_mainactivity(p: Path):
+              s = read(p)
+              old = "navigation.menu.findItem(R.id.nav_tuiguang)?.isVisible = !isPlay"
+              new = "navigation.menu.findItem(R.id.nav_tuiguang)?.isVisible = false"
+              if old in s:
+                  write(p, s.replace(old, new))
+                  print("[OK] Force nav_tuiguang visibility to false in MainActivity")
                   return
 
-              found_any = False
-              for xml in menu_dir.rglob("*.xml"):
-                  s = read(xml)
+              # 兜底：允许不同空格/换行写法
+              pat = r'navigation\.menu\.findItem\(R\.id\.nav_tuiguang\)\?\.\s*isVisible\s*=\s*!isPlay'
+              s2, n = re.subn(pat, new, s)
+              if n > 0:
+                  write(p, s2)
+                  print("[OK] Force nav_tuiguang visibility to false in MainActivity (regex)")
+              else:
+                  print("[WARN] MainActivity nav_tuiguang visibility line not found; skip")
 
-                  def repl(m):
-                      nonlocal found_any
-                      tag = m.group(0)
-                      if "android:visible=" in tag:
-                          found_any = True
-                          return tag
-                      found_any = True
-                      return tag.replace("<item", '<item android:visible="false"', 1)
-
-                  new = re.sub(
-                      rf"<item\b[^>]*android:title=\"{re.escape(title_value)}\"[^>]*?/?>",
-                      repl,
-                      s,
-                      flags=re.S,
-                  )
-                  if new != s:
-                      write(xml, new)
-                      print(f"[OK] Hide {label} (title={title_value}) in {xml}")
-
-              if not found_any:
-                  print(f"[WARN] Menu item with title={title_value} not found in any menu xml")
-
-          # 1) About：删 donate item
+          # 1) About：删 donate
           about = Path("app/src/main/java/io/nekohasekai/sagernet/ui/AboutFragment.kt")
           remove_additem_block_containing(about, "R.string.donate", "Remove donate item in AboutFragment")
 
-          # 2) 侧边栏菜单：优先按 id 隐藏（你原来的两个）
+          # 2) menu：隐藏推广/文档
           menu_dir = Path("app/src/main/res/menu")
           hide_menu_items_by_id(menu_dir, ["nav_tuiguang", "nav_faq"])
 
-          # 3) 兜底：按 title 隐藏“推广”（@string/ads），避免上游改了 id 还漏掉
-          hide_menu_items_by_title(menu_dir, "@string/ads", "ads")
+          # 3) MainActivity：禁止运行时把“推广”强制显示出来
+          main = Path("app/src/main/java/io/nekohasekai/sagernet/ui/MainActivity.kt")
+          if main.exists():
+              force_disable_nav_tuiguang_in_mainactivity(main)
+          else:
+              print("[WARN] MainActivity.kt not found, skip")
 
-          # === DEBUG: 打印所有 menu item id，方便你确认“推广”真实 id ===
+          # DEBUG：打印所有 menu item id
           try:
               ids = []
               for xml in menu_dir.rglob("*.xml"):
@@ -196,12 +182,9 @@ jobs:
               print("[DEBUG] scan menu ids failed:", e)
 
           PY
-          # ============================================================
 
-          # patched-release 分支不要包含 workflows（否则 push 可能被拒/权限限制）
+          # patched-release 分支不要带 workflows
           rm -rf .github/workflows || true
-
-          # 记录同步到的 tag
           echo "$TAG" > .upstream_release_tag
 
           git config user.name "github-actions[bot]"
