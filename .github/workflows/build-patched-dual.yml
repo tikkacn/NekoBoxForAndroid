@@ -36,7 +36,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.target_ref }}
-          fetch-depth: 0   # IMPORTANT: need tags, avoid VERSION_* empty -> 404
+          fetch-depth: 0
 
       - name: Golang Status
         run: find buildScript libcore/*.sh | xargs cat | sha1sum > golang_status
@@ -93,7 +93,7 @@ jobs:
       - name: Prepare signing keystore (p12)
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           echo "${{ secrets.SIGNING_STORE_B64 }}" | base64 -d > "$RUNNER_TEMP/signing.p12"
           echo "KEYSTORE=$RUNNER_TEMP/signing.p12" >> $GITHUB_ENV
 
@@ -102,7 +102,7 @@ jobs:
           BUILD_PLUGIN: none
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           echo "sdk.dir=${ANDROID_HOME}" > local.properties
           echo "ndk.dir=${ANDROID_HOME}/ndk/25.0.8775105" >> local.properties
           export LOCAL_PROPERTIES="${{ secrets.LOCAL_PROPERTIES }}"
@@ -113,7 +113,7 @@ jobs:
           BUILD_PLUGIN: none
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           if [ "${{ github.event.inputs.build_preview }}" != "n" ]; then
             ./gradlew app:assemblePreviewRelease
           fi
@@ -121,18 +121,16 @@ jobs:
             ./gradlew app:assembleOssRelease
           fi
 
-      - name: Sign APKs (zipalign + apksigner)
+      - name: Sign APKs (zipalign + apksigner) -> dist/
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          # Build-tools path
           BT="$(ls -d ${ANDROID_HOME}/build-tools/* | sort -V | tail -n 1)"
           ZIPALIGN="$BT/zipalign"
           APKSIGNER="$BT/apksigner"
           echo "Using build-tools: $BT"
 
-          # Tag naming (UTC+8)
           UPSTREAM_TAG="unknown"
           if [ -f ".upstream_release_tag" ]; then
             UPSTREAM_TAG="$(cat .upstream_release_tag | tr -d ' \r\n')"
@@ -140,7 +138,6 @@ jobs:
           TS="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M)"
           AUTO_TAG="patched-${UPSTREAM_TAG}+build-${TS}"
 
-          # allow override
           FINAL_TAG="${{ github.event.inputs.release_tag }}"
           if [ -z "$FINAL_TAG" ]; then
             FINAL_TAG="$AUTO_TAG"
@@ -172,23 +169,43 @@ jobs:
             echo "OK: $signed"
           }
 
-          # Find all release apks under outputs/apk
-          mapfile -t APKS < <(find app/build/outputs/apk -type f -name "*.apk" | sort)
-          if [ "${#APKS[@]}" -eq 0 ]; then
-            echo "No APK found!"
-            exit 1
+          SIGNED_COUNT=0
+
+          # 1) Preview release outputs
+          if [ "${{ github.event.inputs.build_preview }}" != "n" ]; then
+            if [ -d "app/build/outputs/apk/preview/release" ]; then
+              while IFS= read -r apk; do
+                [ -f "$apk" ] || continue
+                sign_one "$apk"
+                SIGNED_COUNT=$((SIGNED_COUNT+1))
+              done < <(find app/build/outputs/apk/preview/release -type f -name "*.apk" | sort)
+            else
+              echo "WARN: preview/release output dir not found"
+            fi
           fi
 
-          for a in "${APKS[@]}"; do
-            # only sign release variants we built
-            case "$a" in
-              *previewRelease*|*ossRelease*)
-                sign_one "$a"
-                ;;
-              *)
-                ;;
-            esac
-          done
+          # 2) OSS stable release outputs
+          if [ "${{ github.event.inputs.build_stable }}" != "n" ]; then
+            if [ -d "app/build/outputs/apk/oss/release" ]; then
+              while IFS= read -r apk; do
+                [ -f "$apk" ] || continue
+                sign_one "$apk"
+                SIGNED_COUNT=$((SIGNED_COUNT+1))
+              done < <(find app/build/outputs/apk/oss/release -type f -name "*.apk" | sort)
+            else
+              echo "WARN: oss/release output dir not found"
+            fi
+          fi
+
+          echo "Signed count = $SIGNED_COUNT"
+          ls -lah dist || true
+
+          if [ "$SIGNED_COUNT" -eq 0 ]; then
+            echo "ERROR: No APKs signed. dist is empty."
+            echo "DEBUG: list app/build/outputs/apk:"
+            find app/build/outputs/apk -maxdepth 4 -type f -name "*.apk" -print || true
+            exit 1
+          fi
 
           echo "DIST_DIR=$(pwd)/dist" >> $GITHUB_ENV
 
@@ -204,7 +221,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           gh release create "${RELEASE_TAG}" dist/*.apk \
             --title "${RELEASE_TAG}" \
             --notes "Upstream: ${UPSTREAM_TAG}\nBuild time (Asia/Shanghai): ${BUILD_TS}\nBranch: ${{ github.event.inputs.target_ref }}"
