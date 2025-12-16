@@ -3,7 +3,7 @@ name: Sync Upstream Release (Only When Updated)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */6 * * *"  # 每6小时检查一次；想更省就改成每天一次：0 3 * * *
+    - cron: "0 */6 * * *" # 每6小时检查一次；想更省就改成每天一次：0 3 * * *
 
 permissions:
   contents: write
@@ -23,9 +23,6 @@ jobs:
         id: upstream
         run: |
           set -e
-          # runner 通常自带 jq；如果你的环境没 jq，把下一行取消注释安装
-          # sudo apt-get update && sudo apt-get install -y jq
-
           TAG=$(curl -s https://api.github.com/repos/MatsuriDayo/NekoBoxForAndroid/releases/latest | jq -r .tag_name)
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "Upstream latest tag: $TAG"
@@ -60,74 +57,103 @@ jobs:
           # 让 patched-release 变成“上游发布版源码”
           git reset --hard "refs/tags/$TAG"
 
-          # ====== 自动应用你的 UI 改动（不依赖本地/不依赖补丁文件）======
+          # ====== 自动应用你的 UI 改动（稳健版）======
           python3 - <<'PY'
           import re
           from pathlib import Path
 
-          def replace_or_fail(p: Path, pattern: str, repl: str, desc: str):
-            s = p.read_text(encoding="utf-8")
-            new, n = re.subn(pattern, repl, s, flags=re.S)
-            if n == 0:
-              raise SystemExit(f"[FAIL] Pattern not found for {desc} in {p}")
-            p.write_text(new, encoding="utf-8")
-            print(f"[OK] {desc} ({n} replaced)")
+          def read(p: Path) -> str:
+              return p.read_text(encoding="utf-8")
 
-          # 1) AboutFragment：删除 donate 块
+          def write(p: Path, s: str):
+              p.write_text(s, encoding="utf-8")
+
+          def remove_additem_block_containing(p: Path, needle: str, desc: str):
+              s = read(p)
+              i = s.find(needle)
+              if i == -1:
+                  raise SystemExit(f"[FAIL] {desc}: needle not found: {needle} in {p}")
+
+              # 找到离 needle 最近的 addItem( 调用（删整块）
+              call = s.rfind("addItem(", 0, i)
+              if call == -1:
+                  raise SystemExit(f"[FAIL] {desc}: addItem( not found before needle in {p}")
+
+              # 从该行行首开始删除（更干净）
+              line_start = s.rfind("\n", 0, call)
+              line_start = 0 if line_start == -1 else line_start + 1
+
+              # 从 addItem( 的 '(' 开始做括号配对，找到它对应的结尾 ')'
+              open_idx = s.find("(", call)
+              depth = 0
+              end = None
+              for j in range(open_idx, len(s)):
+                  c = s[j]
+                  if c == "(":
+                      depth += 1
+                  elif c == ")":
+                      depth -= 1
+                      if depth == 0:
+                          end = j + 1
+                          break
+              if end is None:
+                  raise SystemExit(f"[FAIL] {desc}: cannot find matching ')' for addItem( in {p}")
+
+              new = s[:line_start] + s[end:]
+              write(p, new)
+              print(f"[OK] {desc}")
+
+          def remove_menu_item(menu_xml: Path, item_id: str, desc: str):
+              s = read(menu_xml)
+              # 兼容多行属性 + 自闭合 <item ... />
+              pat = rf"<item\b[^>]*android:id=\"@\\+id/{re.escape(item_id)}\"[^>]*/>\s*"
+              new, n = re.subn(pat, "", s, flags=re.S)
+              if n == 0:
+                  print(f"[WARN] {desc}: not found ({item_id}) in {menu_xml}, skip")
+              else:
+                  write(menu_xml, new)
+                  print(f"[OK] {desc}")
+
+          def remove_when_case_block(p: Path, rid: str, desc: str):
+              s = read(p)
+              # 删除 `R.id.xxx -> { ... }` 整块（非贪婪）
+              pat = rf"\s*R\.id\.{re.escape(rid)}\s*->\s*\{{.*?\}}\s*"
+              new, n = re.subn(pat, "", s, flags=re.S)
+              if n == 0:
+                  print(f"[WARN] {desc}: not found (R.id.{rid}) in {p}, skip")
+              else:
+                  write(p, new)
+                  print(f"[OK] {desc}")
+
+          def remove_line_by_regex(p: Path, pat: str, desc: str):
+              s = read(p)
+              new, n = re.subn(pat, "", s, flags=re.M)
+              if n == 0:
+                  print(f"[WARN] {desc}: line not found in {p}, skip")
+              else:
+                  write(p, new)
+                  print(f"[OK] {desc}")
+
+          # 1) AboutFragment：删 donate 对应的 addItem(...) 整块（不依赖具体结构）
           about = Path("app/src/main/java/io/nekohasekai/sagernet/ui/AboutFragment.kt")
-          replace_or_fail(
-            about,
-            r"""
-            \.addItem\(\s*
-              MaterialAboutActionItem\.Builder\(\)\s*
-              .*?ic_baseline_card_giftcard_24.*?
-              \.text\(R\.string\.donate\)\s*
-              \.subText\(R\.string\.donate_info\)\s*
-              .*?matsuridayo\.github\.io/index_docs/#donate.*?
-              \.build\(\)\s*
-            \)\s*
-            """,
-            "",
-            "Remove donate item in AboutFragment"
-          )
+          remove_additem_block_containing(about, "R.string.donate", "Remove donate item in AboutFragment")
 
-          # 2) main_drawer_menu：删除 推广/文档 两个 item
+          # 2) drawer 菜单：删 推广/文档 两项
           menu = Path("app/src/main/res/menu/main_drawer_menu.xml")
-          replace_or_fail(
-            menu,
-            r"""\s*<item\b[^>]*android:id="@\+id/nav_tuiguang"[^>]*/>\s*""",
-            "\n",
-            "Remove nav_tuiguang item from drawer menu"
-          )
-          replace_or_fail(
-            menu,
-            r"""\s*<item\b[^>]*android:id="@\+id/nav_faq"[^>]*/>\s*""",
-            "\n",
-            "Remove nav_faq item from drawer menu"
-          )
+          remove_menu_item(menu, "nav_tuiguang", "Remove nav_tuiguang from drawer menu")
+          remove_menu_item(menu, "nav_faq", "Remove nav_faq from drawer menu")
 
-          # 3) MainActivity：删除可见性控制行 + 两个 when 分支
+          # 3) MainActivity：删处理分支 + 可见性控制行
           main = Path("app/src/main/java/io/nekohasekai/sagernet/ui/MainActivity.kt")
-          replace_or_fail(
-            main,
-            r"""\n[ \t]*navigation\.menu\.findItem\(R\.id\.nav_tuiguang\)\?\.\s*isVisible\s*=\s*!isPlay[ \t]*\n""",
-            "\n",
-            "Remove nav_tuiguang visibility line"
-          )
-          replace_or_fail(
-            main,
-            r"""R\.id\.nav_faq\s*->\s*\{.*?\}\s*""",
-            "",
-            "Remove nav_faq handler block"
-          )
-          replace_or_fail(
-            main,
-            r"""R\.id\.nav_tuiguang\s*->\s*\{.*?\}\s*""",
-            "",
-            "Remove nav_tuiguang handler block"
+          remove_when_case_block(main, "nav_faq", "Remove nav_faq handler block")
+          remove_when_case_block(main, "nav_tuiguang", "Remove nav_tuiguang handler block")
+          remove_line_by_regex(
+              main,
+              r"^[ \t]*navigation\.menu\.findItem\(R\.id\.nav_tuiguang\)\?\.[^\n]*\n",
+              "Remove nav_tuiguang visibility line"
           )
           PY
-          # ==========================================================
+          # ============================================
 
           # 记录同步到的 release tag（用于下次对比，避免无意义编译）
           echo "$TAG" > .upstream_release_tag
@@ -144,7 +170,6 @@ jobs:
         if: steps.upstream.outputs.tag != steps.current.outputs.tag
         run: |
           set -e
-          # 触发 main 分支上的 build workflow（它会去 checkout patched-release 来编译）
           curl -s -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
