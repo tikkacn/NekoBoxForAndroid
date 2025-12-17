@@ -6,73 +6,70 @@ on:
 permissions:
   contents: write
 
-env:
-  TZ: Asia/Shanghai
-
 jobs:
   libcore:
     name: Native Build (LibCore)
     runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Shanghai
     steps:
       - name: Checkout patched-release
         uses: actions/checkout@v4
         with:
           ref: patched-release
-
-      - name: Golang Status
-        run: find buildScript libcore/*.sh | xargs cat | sha1sum > golang_status
-
-      - name: Libcore Status
-        run: git ls-files libcore | xargs cat | sha1sum > libcore_status
-
-      - name: LibCore Cache
-        id: cache
-        uses: actions/cache@v4
-        with:
-          path: app/libs/libcore.aar
-          key: libcore-${{ hashFiles('.github/workflows/*.yml', '.github/workflows/*.yaml', 'golang_status', 'libcore_status') }}
+          fetch-depth: 0
 
       - name: Install Golang
-        if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/setup-go@v5
         with:
           go-version: ^1.25
 
-      - name: Native Build
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: ./run lib core
+      - name: Build libcore.aar
+        run: |
+          set -euo pipefail
+          ./run lib core
+          test -f app/libs/libcore.aar
+          ls -lah app/libs/libcore.aar
+
+      - name: Upload libcore.aar
+        uses: actions/upload-artifact@v4
+        with:
+          name: libcore-aar
+          path: app/libs/libcore.aar
 
   build:
-    name: Build Dual APKs (Signed) + Publish Release
+    name: Build Dual APKs + Sign + Release
     runs-on: ubuntu-latest
     needs: [libcore]
+    env:
+      TZ: Asia/Shanghai
+      BUILD_PLUGIN: none
+
+      # 你现在用的是 signing.p12（PKCS12）
+      KSTORE_TYPE: PKCS12
+
     steps:
       - name: Checkout patched-release
         uses: actions/checkout@v4
         with:
           ref: patched-release
+          fetch-depth: 0
 
-      - name: Golang Status
-        run: find buildScript libcore/*.sh | xargs cat | sha1sum > golang_status
-
-      - name: Libcore Status
-        run: git ls-files libcore | xargs cat | sha1sum > libcore_status
-
-      - name: LibCore Cache
-        uses: actions/cache@v4
+      - name: Download libcore.aar
+        uses: actions/download-artifact@v4
         with:
-          path: app/libs/libcore.aar
-          key: libcore-${{ hashFiles('.github/workflows/*.yml', '.github/workflows/*.yaml', 'golang_status', 'libcore_status') }}
+          name: libcore-aar
+          path: app/libs
 
       - name: Gradle cache
         uses: actions/cache@v4
         with:
           path: ~/.gradle
           key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
 
       - name: Init Gradle (project scripts)
-        env:
-          BUILD_PLUGIN: none
         run: |
           set -euo pipefail
           echo "sdk.dir=${ANDROID_HOME}" > local.properties
@@ -80,108 +77,120 @@ jobs:
           export LOCAL_PROPERTIES="${{ secrets.LOCAL_PROPERTIES }}"
           ./run init action gradle
 
-      - name: Build (PreviewRelease / OssRelease)
-        env:
-          BUILD_PLUGIN: none
+      - name: Build (PreviewRelease + OssRelease)
         run: |
           set -euo pipefail
           ./gradlew app:assemblePreviewRelease app:assembleOssRelease
 
-      - name: Prepare signing keystore (PKCS12)
+      - name: Prepare signing keystore
         env:
           SIGNING_KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_B64 }}
         run: |
           set -euo pipefail
-          echo "$SIGNING_KEYSTORE_B64" | base64 -d > signing.p12
+          if [ -z "${SIGNING_KEYSTORE_B64}" ]; then
+            echo "ERROR: SIGNING_KEYSTORE_B64 is empty"
+            exit 1
+          fi
+          echo "${SIGNING_KEYSTORE_B64}" | base64 -d > signing.p12
           ls -lah signing.p12
 
       - name: Validate keystore (fail fast)
         env:
           STOREPASS: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
-          KEYALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
         run: |
           set -euo pipefail
-          keytool -list -v \
-            -keystore signing.p12 \
-            -storetype PKCS12 \
-            -storepass "$STOREPASS" \
-            -alias "$KEYALIAS" >/dev/null
+          if [ -z "${STOREPASS}" ] || [ -z "${ALIAS}" ]; then
+            echo "ERROR: SIGNING_KEYSTORE_PASSWORD or SIGNING_KEY_ALIAS missing"
+            exit 1
+          fi
+          keytool -list -keystore signing.p12 -storetype "${KSTORE_TYPE}" -storepass "${STOREPASS}" -alias "${ALIAS}" >/dev/null
           echo "Keystore OK (alias exists)."
 
-      - name: Collect + Sign APKs -> dist/ (rename nicely)
+      - name: Sign APKs -> dist/
         env:
           STOREPASS: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
-          KEYALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
           KEYPASS: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
           set -euo pipefail
+
+          # Upstream tag：优先用 .upstream_release_tag，否则用 git tag
+          UPSTREAM_TAG=""
+          if [ -f .upstream_release_tag ]; then
+            UPSTREAM_TAG=$(cat .upstream_release_tag | tr -d '\r\n\t ')
+          fi
+          if [ -z "${UPSTREAM_TAG}" ]; then
+            UPSTREAM_TAG=$(git describe --tags --abbrev=0 || true)
+          fi
+          if [ -z "${UPSTREAM_TAG}" ]; then
+            echo "ERROR: cannot determine upstream tag"
+            exit 1
+          fi
+
+          BUILD_TS=$(date +'%Y%m%d-%H%M')
+          echo "UPSTREAM_TAG=${UPSTREAM_TAG}" >> $GITHUB_ENV
+          echo "BUILD_TS=${BUILD_TS}" >> $GITHUB_ENV
+
+          # 找 build-tools 的 apksigner
+          BUILD_TOOLS="$(ls -d ${ANDROID_HOME}/build-tools/* | sort -V | tail -n 1)"
+          APKSIGNER="${BUILD_TOOLS}/apksigner"
+          echo "Using build-tools: ${BUILD_TOOLS}"
+          "${APKSIGNER}" version
+
           mkdir -p dist
 
-          # Read upstream tag if available (from sync workflow), else fallback
-          UPSTREAM_TAG="unknown"
-          if [ -f ".upstream_release_tag" ]; then
-            UPSTREAM_TAG="$(cat .upstream_release_tag | tr -d '\r\n' | xargs)"
-          else
-            UPSTREAM_TAG="$(git describe --tags --abbrev=0 2>/dev/null || echo unknown)"
-          fi
-          echo "UPSTREAM_TAG=$UPSTREAM_TAG" >> $GITHUB_ENV
-          echo "Upstream tag: $UPSTREAM_TAG"
-
-          # Find latest build-tools apksigner
-          BUILD_TOOLS="$(ls -1 "${ANDROID_HOME}/build-tools" | sort -V | tail -n 1)"
-          APKSIGNER="${ANDROID_HOME}/build-tools/${BUILD_TOOLS}/apksigner"
-          echo "Using build-tools: ${BUILD_TOOLS}"
-          "${APKSIGNER}" version || true
+          detect_abi() {
+            local f="$1"
+            if echo "$f" | grep -q "arm64-v8a"; then echo "arm64-v8a"; return; fi
+            if echo "$f" | grep -q "armeabi-v7a"; then echo "armeabi-v7a"; return; fi
+            if echo "$f" | grep -q "x86_64"; then echo "x86_64"; return; fi
+            if echo "$f" | grep -q "x86"; then echo "x86"; return; fi
+            echo "unknown"
+          }
 
           sign_one() {
             local in_apk="$1"
-            local channel="$2"   # preview | oss
-            local arch="$3"      # arm64-v8a | armeabi-v7a | x86 | x86_64
-            local out_apk="dist/NekoBox-${UPSTREAM_TAG}-${channel}-${arch}-signed.apk"
+            local channel="$2"   # preview / oss
+            local abi
+            abi="$(detect_abi "$in_apk")"
+
+            # ✅ 新命名规则（你要“换下命名规则”）：
+            # NekoBox-<upstreamTag>-<channel>-<abi>-signed.apk
+            local out="dist/NekoBox-${UPSTREAM_TAG}-${channel}-${abi}-signed.apk"
 
             echo "Signing: $in_apk"
             "${APKSIGNER}" sign \
               --ks signing.p12 \
-              --ks-type PKCS12 \
+              --ks-type "${KSTORE_TYPE}" \
               --ks-pass "pass:${STOREPASS}" \
-              --ks-key-alias "${KEYALIAS}" \
+              --ks-key-alias "${ALIAS}" \
               --key-pass "pass:${KEYPASS}" \
-              --out "${out_apk}" \
+              --out "${out}" \
               "${in_apk}"
 
-            "${APKSIGNER}" verify --verbose --print-certs "${out_apk}" >/dev/null
-            echo "OK: ${out_apk}"
-          }
-
-          detect_arch() {
-            local name="$1"
-            if echo "$name" | grep -q "arm64-v8a"; then echo "arm64-v8a"; return; fi
-            if echo "$name" | grep -q "armeabi-v7a"; then echo "armeabi-v7a"; return; fi
-            if echo "$name" | grep -q "x86_64"; then echo "x86_64"; return; fi
-            if echo "$name" | grep -qE "(^|[^_])x86([^_]|$)"; then echo "x86"; return; fi
-            echo "unknown"
+            "${APKSIGNER}" verify --print-certs "${out}" >/dev/null
+            echo "OK: ${out}"
           }
 
           SIGNED_COUNT=0
 
-          # 1) Preview release outputs
+          # Preview release outputs
           if [ -d "app/build/outputs/apk/preview/release" ]; then
             while IFS= read -r apk; do
               [ -f "$apk" ] || continue
-              arch="$(detect_arch "$(basename "$apk")")"
-              sign_one "$apk" "preview" "$arch"
+              sign_one "$apk" "preview"
               SIGNED_COUNT=$((SIGNED_COUNT+1))
             done < <(find app/build/outputs/apk/preview/release -type f -name "*.apk" | sort)
           else
             echo "WARN: preview/release output dir not found"
           fi
 
-          # 2) OSS stable release outputs
+          # OSS stable release outputs
           if [ -d "app/build/outputs/apk/oss/release" ]; then
             while IFS= read -r apk; do
               [ -f "$apk" ] || continue
-              arch="$(detect_arch "$(basename "$apk")")"
-              sign_one "$apk" "oss" "$arch"
+              sign_one "$apk" "oss"
               SIGNED_COUNT=$((SIGNED_COUNT+1))
             done < <(find app/build/outputs/apk/oss/release -type f -name "*.apk" | sort)
           else
@@ -193,41 +202,44 @@ jobs:
 
           if [ "$SIGNED_COUNT" -eq 0 ]; then
             echo "ERROR: No APKs signed. dist is empty."
-            echo "DEBUG: list app/build/outputs/apk:"
             find app/build/outputs/apk -maxdepth 6 -type f -name "*.apk" -print || true
             exit 1
           fi
 
-          echo "DIST_DIR=$(pwd)/dist" >> $GITHUB_ENV
-
-      - name: Upload APKs (Artifacts)
+      - name: Upload APKs (artifacts)
         uses: actions/upload-artifact@v4
         with:
           name: APKs
           path: dist/*.apk
 
-      - name: Publish GitHub Release (both variants)
+      - name: Create GitHub Release + upload assets
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          UPSTREAM_TAG="${UPSTREAM_TAG:-unknown}"
-          TS="$(date +'%Y%m%d-%H%M')"
-          TAG="patched-${UPSTREAM_TAG}+build-${TS}"
-          TITLE="Patched ${UPSTREAM_TAG} (${TS} CST)"
+          # 每次运行都生成一个新的 release tag（不会覆盖旧的）
+          RELEASE_TAG="patched-${UPSTREAM_TAG}+build-${BUILD_TS}"
+          RELEASE_TITLE="Patched ${UPSTREAM_TAG} (${BUILD_TS} CST)"
 
-          echo "TAG=$TAG" >> $GITHUB_ENV
-          echo "RELEASE_TITLE=$TITLE" >> $GITHUB_ENV
-
-          # create release via gh (preinstalled on ubuntu-latest)
-          gh release create "$TAG" dist/*.apk \
-            --title "$TITLE" \
-            --notes "Upstream: ${UPSTREAM_TAG}
+          NOTES=$(
+            cat <<EOF
+Upstream: ${UPSTREAM_TAG}
 Patched branch: patched-release
 Commit: $(git rev-parse --short HEAD)
 
 Artifacts:
-- Preview (signed): NekoBox-${UPSTREAM_TAG}-preview-*-signed.apk
-- OSS Stable (signed): NekoBox-${UPSTREAM_TAG}-oss-*-signed.apk" \
+- Preview (signed)
+- OSS Stable (signed)
+EOF
+          )
+
+          # 创建 tag（指向当前 patched-release HEAD）
+          git tag -f "${RELEASE_TAG}"
+          git push origin -f "${RELEASE_TAG}"
+
+          # 创建/更新 Release，并上传 dist/*.apk
+          gh release create "${RELEASE_TAG}" dist/*.apk \
+            --title "${RELEASE_TITLE}" \
+            --notes "${NOTES}" \
             --latest
