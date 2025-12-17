@@ -13,6 +13,8 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Shanghai
 
     steps:
       - name: Checkout patched-release
@@ -28,42 +30,50 @@ jobs:
 
       - name: Read upstream latest release tag
         id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
+          set -euo pipefail
           TAG=$(curl -fsSL \
             -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
             https://api.github.com/repos/MatsuriDayo/NekoBoxForAndroid/releases/latest \
             | jq -r .tag_name)
-          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+
+          if [ -z "${TAG}" ] || [ "${TAG}" = "null" ]; then
             echo "Failed to get upstream tag_name."
             exit 1
           fi
-          echo "UPSTREAM_TAG=$TAG" >> $GITHUB_ENV
-          echo "Upstream latest tag: $TAG"
+          echo "UPSTREAM_TAG=${TAG}" >> "${GITHUB_ENV}"
+          echo "Upstream latest tag: ${TAG}"
 
       - name: Read current synced tag (from patched-release)
         id: current
         run: |
-          set -e
+          set -euo pipefail
           CUR=""
           if [ -f .upstream_release_tag ]; then
             CUR=$(cat .upstream_release_tag | tr -d '\r\n\t ')
           fi
-          echo "CURRENT_TAG=$CUR" >> $GITHUB_ENV
-          echo "Current synced tag: $CUR"
+          echo "CURRENT_TAG=${CUR}" >> "${GITHUB_ENV}"
+          echo "Current synced tag: ${CUR}"
 
-      - name: Exit if no update
+      - name: Compare tags (gate)
+        id: compare
         run: |
-          set -e
+          set -euo pipefail
           if [ "${UPSTREAM_TAG}" = "${CURRENT_TAG}" ]; then
+            echo "updated=false" >> "${GITHUB_OUTPUT}"
             echo "No upstream update. Exit."
-            exit 0
+          else
+            echo "updated=true" >> "${GITHUB_OUTPUT}"
+            echo "Upstream updated: ${CURRENT_TAG} -> ${UPSTREAM_TAG}"
           fi
-          echo "Upstream updated: ${CURRENT_TAG} -> ${UPSTREAM_TAG}"
 
       - name: Backup workflows (keep ours)
+        if: steps.compare.outputs.updated == 'true'
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p /tmp/keep_workflows
           if [ -d .github/workflows ]; then
             tar -czf /tmp/keep_workflows/workflows.tgz .github/workflows
@@ -73,19 +83,19 @@ jobs:
           fi
 
       - name: Add upstream remote & fetch tags
+        if: steps.compare.outputs.updated == 'true'
         run: |
-          set -e
+          set -euo pipefail
           git remote remove upstream 2>/dev/null || true
           git remote add upstream https://github.com/MatsuriDayo/NekoBoxForAndroid.git
           git fetch upstream --tags --force
 
       - name: Sync upstream tag -> patched-release (hard reset), then restore workflows
+        if: steps.compare.outputs.updated == 'true'
         run: |
-          set -e
-          # 把 patched-release 强制对齐到上游 tag
+          set -euo pipefail
           git reset --hard "refs/tags/${UPSTREAM_TAG}"
 
-          # 还原我们自己的 workflows（避免被上游覆盖，且避免触发 workflow 权限相关 push 问题）
           if [ -f /tmp/keep_workflows/workflows.tgz ]; then
             rm -rf .github/workflows || true
             tar -xzf /tmp/keep_workflows/workflows.tgz
@@ -93,10 +103,11 @@ jobs:
           fi
 
       - name: Apply UI patches (About donate + hide nav items + remove handlers)
+        if: steps.compare.outputs.updated == 'true'
         run: |
-          set -e
+          set -euo pipefail
           python3 - << 'PY'
-          import os, re, sys
+          import os, re
 
           def read(path):
             with open(path, "r", encoding="utf-8") as f:
@@ -106,7 +117,6 @@ jobs:
             with open(path, "w", encoding="utf-8") as f:
               f.write(s)
 
-          def info(msg): print(msg)
           def warn(msg): print("[WARN]", msg)
           def ok(msg): print("[OK]", msg)
 
@@ -114,10 +124,7 @@ jobs:
           about_path = "app/src/main/java/io/nekohasekai/sagernet/ui/AboutFragment.kt"
           if os.path.exists(about_path):
             s = read(about_path)
-            before = s
 
-            # 删除包含 .text(R.string.donate) 的 addItem(...) 块（尽量宽松匹配）
-            # 常见结构：.addItem( MaterialAboutActionItem.Builder() ... .text(R.string.donate) ... .build())
             pattern = re.compile(
               r"""\.addItem\(\s*MaterialAboutActionItem\.Builder\(\)\s*
                   (?:.|\n)*?\.text\(\s*R\.string\.donate\s*\)\s*
@@ -125,8 +132,8 @@ jobs:
               re.X
             )
             s2, n = pattern.subn("", s, count=1)
+
             if n == 0:
-              # 兼容另一种写法：.icon(...)\n.text(R.string.donate)\n... .build())
               pattern2 = re.compile(
                 r"""\.addItem\(\s*
                     (?:.|\n)*?R\.string\.donate
@@ -143,15 +150,12 @@ jobs:
           else:
             warn(f"AboutFragment not found: {about_path}")
 
-          # -------- Patch 2: Hide drawer menu items (nav_tuiguang & nav_faq) --------
+          # -------- Patch 2: Hide drawer menu items --------
           menu_path = "app/src/main/res/menu/main_drawer_menu.xml"
           if os.path.exists(menu_path):
             s = read(menu_path)
 
             def hide_item(xml: str, item_id: str):
-              # 给对应 <item ... android:id="@+id/xxx" ...> 增加 android:visible="false"
-              # 如果已存在 android:visible 则改成 false
-              # 这里用“单个 <item ... />”的匹配（该文件就是这种结构）
               pat = re.compile(rf'(<item\b[^>]*\bandroid:id="@\+id/{re.escape(item_id)}"[^>]*)(/?>)', re.M)
               m = pat.search(xml)
               if not m:
@@ -180,38 +184,32 @@ jobs:
           else:
             warn(f"Drawer menu xml not found: {menu_path}")
 
-          # -------- Patch 3: MainActivity - force hide + remove click handler blocks --------
+          # -------- Patch 3: MainActivity remove handlers + force hide --------
           main_path = "app/src/main/java/io/nekohasekai/sagernet/ui/MainActivity.kt"
           if os.path.exists(main_path):
             s = read(main_path)
             orig = s
 
-            # 3.1 强制隐藏（把任何对 nav_tuiguang 的 isVisible 赋值改成 false）
-            s, n1 = re.subn(
+            s, _ = re.subn(
               r'(navigation\.menu\.findItem\(R\.id\.nav_tuiguang\)\?\.(?:isVisible|setVisible)\s*=\s*).*$',
               r'\1false',
               s,
               flags=re.M
             )
 
-            # 3.2 如果没有 nav_faq 隐藏行，补一行（放在 nav_tuiguang 隐藏行后面或合适位置）
-            if "R.id.nav_faq" not in s or "findItem(R.id.nav_faq)?.isVisible" not in s:
-              # 尝试在 nav_tuiguang 行之后插入
+            if "findItem(R.id.nav_faq)?.isVisible" not in s:
               pat_insert = re.compile(r'(navigation\.menu\.findItem\(R\.id\.nav_tuiguang\)\?\.(?:isVisible|setVisible)\s*=\s*false\s*\n)')
               if pat_insert.search(s):
                 s = pat_insert.sub(r'\1        navigation.menu.findItem(R.id.nav_faq)?.isVisible = false\n', s, count=1)
                 ok("Add hide line for nav_faq")
               else:
-                # 找不到位置就不强插，避免破坏结构
                 warn("Could not find nav_tuiguang hide line to insert nav_faq hide; skip insert")
 
-            # 3.3 删除 when(id) 中的 nav_faq/nav_tuiguang 处理块（宽松：只要是 `R.id.xxx -> { ... }` 这种结构）
             def remove_when_case(code: str, case_id: str):
               key = f"R.id.{case_id} -> {{"
               idx = code.find(key)
               if idx == -1:
                 return code, False
-              # 从 idx 开始，找到匹配的大括号结束位置
               i = idx + len(key)
               depth = 1
               while i < len(code) and depth > 0:
@@ -220,46 +218,35 @@ jobs:
                 elif code[i] == "}":
                   depth -= 1
                 i += 1
-              # i 现在在 case 块结尾的 '}' 后面，继续吃掉可能的空白/换行
               j = i
               while j < len(code) and code[j] in " \t\r\n":
                 j += 1
-              # 删除整个 case 块（含前导缩进保留：从 idx 往前吃掉本行缩进）
               line_start = code.rfind("\n", 0, idx)
-              if line_start != -1:
-                # 如果前面是换行，从换行后开始删
-                start = line_start + 1
-              else:
-                start = idx
+              start = line_start + 1 if line_start != -1 else idx
               return code[:start] + code[j:], True
 
             s, rm1 = remove_when_case(s, "nav_faq")
-            if rm1:
-              ok("Remove nav_faq handler block")
-            else:
-              warn("Remove nav_faq handler block: not found, skip")
+            ok("Remove nav_faq handler block") if rm1 else warn("Remove nav_faq handler block: not found, skip")
 
             s, rm2 = remove_when_case(s, "nav_tuiguang")
-            if rm2:
-              ok("Remove nav_tuiguang handler block")
-            else:
-              warn("Remove nav_tuiguang handler block: not found, skip")
+            ok("Remove nav_tuiguang handler block") if rm2 else warn("Remove nav_tuiguang handler block: not found, skip")
 
             if s != orig:
               write(main_path, s)
           else:
             warn(f"MainActivity not found: {main_path}")
-
           PY
 
       - name: Record synced tag
+        if: steps.compare.outputs.updated == 'true'
         run: |
-          set -e
+          set -euo pipefail
           echo "${UPSTREAM_TAG}" > .upstream_release_tag
 
       - name: Commit changes (if any)
+        if: steps.compare.outputs.updated == 'true'
         run: |
-          set -e
+          set -euo pipefail
           git add -A
           if git diff --cached --quiet; then
             echo "No changes to commit."
@@ -268,20 +255,21 @@ jobs:
           git commit -m "Sync upstream release ${UPSTREAM_TAG} + apply UI patches"
 
       - name: Push patched-release
+        if: steps.compare.outputs.updated == 'true'
         run: |
-          set -e
-          # 我们 reset 到 tag，所以通常需要 force 更新分支
+          set -euo pipefail
           git push origin HEAD:patched-release --force-with-lease
 
       - name: Trigger build workflow (only when updated)
+        if: steps.compare.outputs.updated == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
-          # 触发你仓库里的 build-patched-release.yml（ref 固定 patched-release）
+          set -euo pipefail
+          # 触发你仓库里的 build-patched-dual.yml（ref 固定 patched-release）
           curl -fsSL -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/build-patched-release.yml/dispatches \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/build-patched-dual.yml/dispatches \
             -d "{\"ref\":\"patched-release\"}" >/dev/null
           echo "Build workflow dispatched."
