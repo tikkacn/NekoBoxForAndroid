@@ -44,10 +44,7 @@ jobs:
     env:
       TZ: Asia/Shanghai
       BUILD_PLUGIN: none
-
-      # 你现在用的是 signing.p12（PKCS12）
       KSTORE_TYPE: PKCS12
-
     steps:
       - name: Checkout patched-release
         uses: actions/checkout@v4
@@ -87,10 +84,7 @@ jobs:
           SIGNING_KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_B64 }}
         run: |
           set -euo pipefail
-          if [ -z "${SIGNING_KEYSTORE_B64}" ]; then
-            echo "ERROR: SIGNING_KEYSTORE_B64 is empty"
-            exit 1
-          fi
+          test -n "${SIGNING_KEYSTORE_B64}"
           echo "${SIGNING_KEYSTORE_B64}" | base64 -d > signing.p12
           ls -lah signing.p12
 
@@ -100,12 +94,10 @@ jobs:
           ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
         run: |
           set -euo pipefail
-          if [ -z "${STOREPASS}" ] || [ -z "${ALIAS}" ]; then
-            echo "ERROR: SIGNING_KEYSTORE_PASSWORD or SIGNING_KEY_ALIAS missing"
-            exit 1
-          fi
+          test -n "${STOREPASS}"
+          test -n "${ALIAS}"
           keytool -list -keystore signing.p12 -storetype "${KSTORE_TYPE}" -storepass "${STOREPASS}" -alias "${ALIAS}" >/dev/null
-          echo "Keystore OK (alias exists)."
+          echo "Keystore OK."
 
       - name: Sign APKs -> dist/
         env:
@@ -115,24 +107,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Upstream tag：优先用 .upstream_release_tag，否则用 git tag
           UPSTREAM_TAG=""
           if [ -f .upstream_release_tag ]; then
-            UPSTREAM_TAG=$(cat .upstream_release_tag | tr -d '\r\n\t ')
+            UPSTREAM_TAG=$(tr -d '\r\n\t ' < .upstream_release_tag)
           fi
           if [ -z "${UPSTREAM_TAG}" ]; then
             UPSTREAM_TAG=$(git describe --tags --abbrev=0 || true)
           fi
-          if [ -z "${UPSTREAM_TAG}" ]; then
-            echo "ERROR: cannot determine upstream tag"
-            exit 1
-          fi
+          test -n "${UPSTREAM_TAG}"
 
           BUILD_TS=$(date +'%Y%m%d-%H%M')
           echo "UPSTREAM_TAG=${UPSTREAM_TAG}" >> $GITHUB_ENV
           echo "BUILD_TS=${BUILD_TS}" >> $GITHUB_ENV
 
-          # 找 build-tools 的 apksigner
           BUILD_TOOLS="$(ls -d ${ANDROID_HOME}/build-tools/* | sort -V | tail -n 1)"
           APKSIGNER="${BUILD_TOOLS}/apksigner"
           echo "Using build-tools: ${BUILD_TOOLS}"
@@ -154,12 +141,9 @@ jobs:
             local channel="$2"   # preview / oss
             local abi
             abi="$(detect_abi "$in_apk")"
-
-            # ✅ 新命名规则（你要“换下命名规则”）：
-            # NekoBox-<upstreamTag>-<channel>-<abi>-signed.apk
             local out="dist/NekoBox-${UPSTREAM_TAG}-${channel}-${abi}-signed.apk"
 
-            echo "Signing: $in_apk"
+            echo "Signing: $in_apk -> $out"
             "${APKSIGNER}" sign \
               --ks signing.p12 \
               --ks-type "${KSTORE_TYPE}" \
@@ -170,41 +154,29 @@ jobs:
               "${in_apk}"
 
             "${APKSIGNER}" verify --print-certs "${out}" >/dev/null
-            echo "OK: ${out}"
           }
 
           SIGNED_COUNT=0
 
-          # Preview release outputs
           if [ -d "app/build/outputs/apk/preview/release" ]; then
             while IFS= read -r apk; do
               [ -f "$apk" ] || continue
               sign_one "$apk" "preview"
               SIGNED_COUNT=$((SIGNED_COUNT+1))
             done < <(find app/build/outputs/apk/preview/release -type f -name "*.apk" | sort)
-          else
-            echo "WARN: preview/release output dir not found"
           fi
 
-          # OSS stable release outputs
           if [ -d "app/build/outputs/apk/oss/release" ]; then
             while IFS= read -r apk; do
               [ -f "$apk" ] || continue
               sign_one "$apk" "oss"
               SIGNED_COUNT=$((SIGNED_COUNT+1))
             done < <(find app/build/outputs/apk/oss/release -type f -name "*.apk" | sort)
-          else
-            echo "WARN: oss/release output dir not found"
           fi
 
           echo "Signed count = $SIGNED_COUNT"
           ls -lah dist || true
-
-          if [ "$SIGNED_COUNT" -eq 0 ]; then
-            echo "ERROR: No APKs signed. dist is empty."
-            find app/build/outputs/apk -maxdepth 6 -type f -name "*.apk" -print || true
-            exit 1
-          fi
+          test "$SIGNED_COUNT" -gt 0
 
       - name: Upload APKs (artifacts)
         uses: actions/upload-artifact@v4
@@ -218,28 +190,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 每次运行都生成一个新的 release tag（不会覆盖旧的）
           RELEASE_TAG="patched-${UPSTREAM_TAG}+build-${BUILD_TS}"
           RELEASE_TITLE="Patched ${UPSTREAM_TAG} (${BUILD_TS} CST)"
 
-          NOTES=$(
-            cat <<EOF
-Upstream: ${UPSTREAM_TAG}
-Patched branch: patched-release
-Commit: $(git rev-parse --short HEAD)
+          printf "Upstream: %s\nPatched branch: patched-release\nCommit: %s\n\nArtifacts:\n- Preview (signed)\n- OSS Stable (signed)\n" \
+            "${UPSTREAM_TAG}" "$(git rev-parse --short HEAD)" > release_notes.txt
 
-Artifacts:
-- Preview (signed)
-- OSS Stable (signed)
-EOF
-          )
-
-          # 创建 tag（指向当前 patched-release HEAD）
           git tag -f "${RELEASE_TAG}"
           git push origin -f "${RELEASE_TAG}"
 
-          # 创建/更新 Release，并上传 dist/*.apk
           gh release create "${RELEASE_TAG}" dist/*.apk \
             --title "${RELEASE_TITLE}" \
-            --notes "${NOTES}" \
+            --notes-file release_notes.txt \
             --latest
