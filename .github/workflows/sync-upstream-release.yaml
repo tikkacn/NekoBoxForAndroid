@@ -20,13 +20,16 @@ jobs:
     env:
       TZ: Asia/Shanghai
       BUILD_WORKFLOW_FILE: build-patched-dual.yml
+      TARGET_REPO: tikkacn/NekoBoxForAndroid
 
     steps:
       - name: Checkout patched-release
         uses: actions/checkout@v4
         with:
+          repository: tikkacn/NekoBoxForAndroid
           ref: patched-release
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Git config
         run: |
@@ -103,7 +106,6 @@ jobs:
           set -euo pipefail
 
           mkdir -p .github/workflows
-
           git checkout origin/main -- .github/workflows || true
 
           echo "Restored .github/workflows from origin/main"
@@ -140,7 +142,6 @@ jobs:
               print("[ERROR]", msg)
 
           # -------- Patch 1: AboutFragment remove donate item --------
-          # 这个不是关键补丁，找不到只警告，不终止。
           about_path = "app/src/main/java/io/nekohasekai/sagernet/ui/AboutFragment.kt"
 
           if os.path.exists(about_path):
@@ -173,7 +174,6 @@ jobs:
               warn(f"AboutFragment not found: {about_path}")
 
           # -------- Patch 2: Hide drawer menu items --------
-          # 这是关键补丁，nav_tuiguang / nav_faq 找不到或无法隐藏则失败。
           menu_path = "app/src/main/res/menu/main_drawer_menu.xml"
 
           if os.path.exists(menu_path):
@@ -229,7 +229,6 @@ jobs:
               fail(f"Drawer menu xml not found: {menu_path}")
 
           # -------- Patch 3: MainActivity remove handlers and force hide --------
-          # 删除点击逻辑找不到时先警告，避免上游轻微改动导致完全同步失败。
           main_path = "app/src/main/java/io/nekohasekai/sagernet/ui/MainActivity.kt"
 
           if os.path.exists(main_path):
@@ -354,6 +353,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          gh workflow run "${BUILD_WORKFLOW_FILE}" --ref main
+          gh workflow run "${BUILD_WORKFLOW_FILE}" \
+            --repo "${TARGET_REPO}" \
+            --ref main
 
-          echo "Build workflow dispatched: ${BUILD_WORKFLOW_FILE}"
+          echo "Build workflow dispatched: ${BUILD_WORKFLOW_FILE} in ${TARGET_REPO}"
