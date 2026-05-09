@@ -74,8 +74,21 @@ jobs:
         run: |
           set -euo pipefail
 
-          yes | sdkmanager "ndk;25.0.8775105"
+          SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+
+          if [ ! -x "${SDKMANAGER}" ]; then
+            echo "sdkmanager not found at ${SDKMANAGER}"
+            echo "ANDROID_HOME=${ANDROID_HOME}"
+            echo "Searching sdkmanager..."
+            find "${ANDROID_HOME}" -name sdkmanager -type f || true
+            exit 1
+          fi
+
+          yes | "${SDKMANAGER}" --licenses >/dev/null || true
+          yes | "${SDKMANAGER}" "ndk;25.0.8775105"
+
           test -d "${ANDROID_HOME}/ndk/25.0.8775105"
+          echo "NDK installed: ${ANDROID_HOME}/ndk/25.0.8775105"
 
       - name: Init Gradle project scripts
         env:
