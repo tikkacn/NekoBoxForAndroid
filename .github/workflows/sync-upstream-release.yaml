@@ -140,7 +140,7 @@ jobs:
               print("[ERROR]", msg)
 
           # -------- Patch 1: AboutFragment remove donate item --------
-          # 这个不是关键补丁，找不到只警告，不终止
+          # 这个不是关键补丁，找不到只警告，不终止。
           about_path = "app/src/main/java/io/nekohasekai/sagernet/ui/AboutFragment.kt"
 
           if os.path.exists(about_path):
@@ -173,34 +173,42 @@ jobs:
               warn(f"AboutFragment not found: {about_path}")
 
           # -------- Patch 2: Hide drawer menu items --------
-          # 这是关键补丁，nav_tuiguang / nav_faq 找不到或无法隐藏则失败
+          # 这是关键补丁，nav_tuiguang / nav_faq 找不到或无法隐藏则失败。
           menu_path = "app/src/main/res/menu/main_drawer_menu.xml"
 
           if os.path.exists(menu_path):
               s = read(menu_path)
 
               def hide_item(xml, item_id):
-                  pat = re.compile(
-                      rf'(<item\b[^>]*\bandroid:id="@\+id/{re.escape(item_id)}"[^>]*)(/?>)',
-                      re.M,
-                  )
+                  id_pat = f'android:id="@+id/{item_id}"'
+                  idx = xml.find(id_pat)
 
-                  m = pat.search(xml)
-                  if not m:
+                  if idx == -1:
                       return xml, False, f"not found ({item_id})"
 
-                  head, tail = m.group(1), m.group(2)
+                  start = xml.rfind("<item", 0, idx)
+                  if start == -1:
+                      return xml, False, f"cannot find <item start ({item_id})"
 
-                  if 'android:visible=' in head:
-                      head2 = re.sub(
+                  tag_end = xml.find(">", idx)
+                  if tag_end == -1:
+                      return xml, False, f"cannot find item tag end ({item_id})"
+
+                  tag = xml[start:tag_end + 1]
+
+                  if 'android:visible=' in tag:
+                      tag2 = re.sub(
                           r'android:visible="[^"]*"',
                           'android:visible="false"',
-                          head,
+                          tag,
                       )
                   else:
-                      head2 = head + '\n            android:visible="false"'
+                      if tag.endswith("/>"):
+                          tag2 = tag[:-2] + '\n        android:visible="false" />'
+                      else:
+                          tag2 = tag[:-1] + '\n        android:visible="false">'
 
-                  xml2 = xml[:m.start()] + head2 + tail + xml[m.end():]
+                  xml2 = xml[:start] + tag2 + xml[tag_end + 1:]
                   return xml2, True, "ok"
 
               changed_any = False
@@ -221,7 +229,7 @@ jobs:
               fail(f"Drawer menu xml not found: {menu_path}")
 
           # -------- Patch 3: MainActivity remove handlers and force hide --------
-          # 删除点击逻辑找不到时先警告，避免上游轻微改动导致完全同步失败
+          # 删除点击逻辑找不到时先警告，避免上游轻微改动导致完全同步失败。
           main_path = "app/src/main/java/io/nekohasekai/sagernet/ui/MainActivity.kt"
 
           if os.path.exists(main_path):
@@ -346,6 +354,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          gh workflow run "${BUILD_WORKFLOW_FILE}" --ref patched-release
+          gh workflow run "${BUILD_WORKFLOW_FILE}" --ref main
 
           echo "Build workflow dispatched: ${BUILD_WORKFLOW_FILE}"
