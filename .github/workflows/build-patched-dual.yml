@@ -12,6 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TZ: Asia/Shanghai
+
     steps:
       - name: Checkout patched-release
         uses: actions/checkout@v4
@@ -27,7 +28,9 @@ jobs:
       - name: Build libcore.aar
         run: |
           set -euo pipefail
+
           ./run lib core
+
           test -f app/libs/libcore.aar
           ls -lah app/libs/libcore.aar
 
@@ -45,6 +48,7 @@ jobs:
       TZ: Asia/Shanghai
       BUILD_PLUGIN: none
       KSTORE_TYPE: PKCS12
+
     steps:
       - name: Checkout patched-release
         uses: actions/checkout@v4
@@ -66,17 +70,29 @@ jobs:
           restore-keys: |
             gradle-${{ runner.os }}-
 
-      - name: Init Gradle (project scripts)
+      - name: Ensure Android NDK
         run: |
           set -euo pipefail
+
+          yes | sdkmanager "ndk;25.0.8775105"
+          test -d "${ANDROID_HOME}/ndk/25.0.8775105"
+
+      - name: Init Gradle project scripts
+        env:
+          LOCAL_PROPERTIES_SECRET: ${{ secrets.LOCAL_PROPERTIES }}
+        run: |
+          set -euo pipefail
+
           echo "sdk.dir=${ANDROID_HOME}" > local.properties
           echo "ndk.dir=${ANDROID_HOME}/ndk/25.0.8775105" >> local.properties
-          export LOCAL_PROPERTIES="${{ secrets.LOCAL_PROPERTIES }}"
+
+          export LOCAL_PROPERTIES="${LOCAL_PROPERTIES_SECRET}"
           ./run init action gradle
 
-      - name: Build (PreviewRelease + OssRelease)
+      - name: Build PreviewRelease and OssRelease
         run: |
           set -euo pipefail
+
           ./gradlew app:assemblePreviewRelease app:assembleOssRelease
 
       - name: Prepare signing keystore
@@ -84,22 +100,30 @@ jobs:
           SIGNING_KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_B64 }}
         run: |
           set -euo pipefail
+
           test -n "${SIGNING_KEYSTORE_B64}"
           echo "${SIGNING_KEYSTORE_B64}" | base64 -d > signing.p12
           ls -lah signing.p12
 
-      - name: Validate keystore (fail fast)
+      - name: Validate keystore
         env:
           STOREPASS: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
           ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
         run: |
           set -euo pipefail
+
           test -n "${STOREPASS}"
           test -n "${ALIAS}"
-          keytool -list -keystore signing.p12 -storetype "${KSTORE_TYPE}" -storepass "${STOREPASS}" -alias "${ALIAS}" >/dev/null
+
+          keytool -list \
+            -keystore signing.p12 \
+            -storetype "${KSTORE_TYPE}" \
+            -storepass "${STOREPASS}" \
+            -alias "${ALIAS}" >/dev/null
+
           echo "Keystore OK."
 
-      - name: Sign APKs -> dist/
+      - name: Sign APKs to dist
         env:
           STOREPASS: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
           ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
@@ -107,21 +131,36 @@ jobs:
         run: |
           set -euo pipefail
 
+          test -n "${STOREPASS}"
+          test -n "${ALIAS}"
+
+          # 如果没有单独设置 key password，就默认等于 keystore password
+          KEYPASS="${KEYPASS:-$STOREPASS}"
+
           UPSTREAM_TAG=""
           if [ -f .upstream_release_tag ]; then
             UPSTREAM_TAG=$(tr -d '\r\n\t ' < .upstream_release_tag)
+            echo "Using .upstream_release_tag: ${UPSTREAM_TAG}"
           fi
+
           if [ -z "${UPSTREAM_TAG}" ]; then
             UPSTREAM_TAG=$(git describe --tags --abbrev=0 || true)
+            echo "Using git tag: ${UPSTREAM_TAG}"
           fi
-          test -n "${UPSTREAM_TAG}"
+
+          if [ -z "${UPSTREAM_TAG}" ]; then
+            echo "ERROR: Cannot detect upstream tag."
+            exit 1
+          fi
 
           BUILD_TS=$(date +'%Y%m%d-%H%M')
-          echo "UPSTREAM_TAG=${UPSTREAM_TAG}" >> $GITHUB_ENV
-          echo "BUILD_TS=${BUILD_TS}" >> $GITHUB_ENV
+          echo "UPSTREAM_TAG=${UPSTREAM_TAG}" >> "${GITHUB_ENV}"
+          echo "BUILD_TS=${BUILD_TS}" >> "${GITHUB_ENV}"
 
-          BUILD_TOOLS="$(ls -d ${ANDROID_HOME}/build-tools/* | sort -V | tail -n 1)"
+          BUILD_TOOLS="$(ls -d "${ANDROID_HOME}"/build-tools/* | sort -V | tail -n 1)"
           APKSIGNER="${BUILD_TOOLS}/apksigner"
+          ZIPALIGN="${BUILD_TOOLS}/zipalign"
+
           echo "Using build-tools: ${BUILD_TOOLS}"
           "${APKSIGNER}" version
 
@@ -129,21 +168,48 @@ jobs:
 
           detect_abi() {
             local f="$1"
-            if echo "$f" | grep -q "arm64-v8a"; then echo "arm64-v8a"; return; fi
-            if echo "$f" | grep -q "armeabi-v7a"; then echo "armeabi-v7a"; return; fi
-            if echo "$f" | grep -q "x86_64"; then echo "x86_64"; return; fi
-            if echo "$f" | grep -q "x86"; then echo "x86"; return; fi
-            echo "unknown"
+
+            if echo "$f" | grep -q "arm64-v8a"; then
+              echo "arm64-v8a"
+              return
+            fi
+
+            if echo "$f" | grep -q "armeabi-v7a"; then
+              echo "armeabi-v7a"
+              return
+            fi
+
+            if echo "$f" | grep -q "x86_64"; then
+              echo "x86_64"
+              return
+            fi
+
+            if echo "$f" | grep -q "x86"; then
+              echo "x86"
+              return
+            fi
+
+            echo "universal"
           }
 
           sign_one() {
             local in_apk="$1"
-            local channel="$2"   # preview / oss
+            local channel="$2"
             local abi
-            abi="$(detect_abi "$in_apk")"
-            local out="dist/NekoBox-${UPSTREAM_TAG}-${channel}-${abi}-signed.apk"
+            local base
+            local aligned
+            local out
 
-            echo "Signing: $in_apk -> $out"
+            abi="$(detect_abi "$in_apk")"
+            base="$(basename "$in_apk" .apk)"
+
+            aligned="dist/${base}-aligned.apk"
+            out="dist/NekoBox-${UPSTREAM_TAG}-${channel}-${abi}-${base}-signed.apk"
+
+            echo "Zipalign: ${in_apk} -> ${aligned}"
+            "${ZIPALIGN}" -p -f 4 "${in_apk}" "${aligned}"
+
+            echo "Signing: ${aligned} -> ${out}"
             "${APKSIGNER}" sign \
               --ks signing.p12 \
               --ks-type "${KSTORE_TYPE}" \
@@ -151,9 +217,10 @@ jobs:
               --ks-key-alias "${ALIAS}" \
               --key-pass "pass:${KEYPASS}" \
               --out "${out}" \
-              "${in_apk}"
+              "${aligned}"
 
             "${APKSIGNER}" verify --print-certs "${out}" >/dev/null
+            rm -f "${aligned}"
           }
 
           SIGNED_COUNT=0
@@ -162,7 +229,7 @@ jobs:
             while IFS= read -r apk; do
               [ -f "$apk" ] || continue
               sign_one "$apk" "preview"
-              SIGNED_COUNT=$((SIGNED_COUNT+1))
+              SIGNED_COUNT=$((SIGNED_COUNT + 1))
             done < <(find app/build/outputs/apk/preview/release -type f -name "*.apk" | sort)
           fi
 
@@ -170,30 +237,31 @@ jobs:
             while IFS= read -r apk; do
               [ -f "$apk" ] || continue
               sign_one "$apk" "oss"
-              SIGNED_COUNT=$((SIGNED_COUNT+1))
+              SIGNED_COUNT=$((SIGNED_COUNT + 1))
             done < <(find app/build/outputs/apk/oss/release -type f -name "*.apk" | sort)
           fi
 
-          echo "Signed count = $SIGNED_COUNT"
+          echo "Signed count = ${SIGNED_COUNT}"
           ls -lah dist || true
-          test "$SIGNED_COUNT" -gt 0
 
-      - name: Upload APKs (artifacts)
+          test "${SIGNED_COUNT}" -gt 0
+
+      - name: Upload APKs as artifacts
         uses: actions/upload-artifact@v4
         with:
           name: APKs
           path: dist/*.apk
 
-      - name: Create GitHub Release + upload assets
+      - name: Create GitHub Release and upload assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          RELEASE_TAG="patched-${UPSTREAM_TAG}+build-${BUILD_TS}"
+          RELEASE_TAG="patched-${UPSTREAM_TAG}-build-${BUILD_TS}"
           RELEASE_TITLE="Patched ${UPSTREAM_TAG} (${BUILD_TS} CST)"
 
-          printf "Upstream: %s\nPatched branch: patched-release\nCommit: %s\n\nArtifacts:\n- Preview (signed)\n- OSS Stable (signed)\n" \
+          printf "Upstream: %s\nPatched branch: patched-release\nCommit: %s\n\nArtifacts:\n- Preview signed APKs\n- OSS signed APKs\n" \
             "${UPSTREAM_TAG}" "$(git rev-parse --short HEAD)" > release_notes.txt
 
           git tag -f "${RELEASE_TAG}"
