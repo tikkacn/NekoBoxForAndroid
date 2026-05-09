@@ -76,49 +76,6 @@ class AboutFragment : ToolbarFragment(R.layout.layout_about) {
                 .addCard(
                     MaterialAboutCard.Builder()
                         .outline(false)
-                        .addItem(
-                            MaterialAboutActionItem.Builder()
-                                .icon(R.drawable.ic_baseline_update_24)
-                                .text(R.string.app_version)
-                                .subText(SagerNet.appVersionNameForDisplay)
-                                .setOnClickAction {
-                                    requireContext().launchCustomTab(
-                                        "https://github.com/MatsuriDayo/NekoBoxForAndroid/releases"
-                                    )
-                                }
-                                .build())
-                        .addItem(
-                            MaterialAboutActionItem.Builder()
-                                .text(R.string.check_update_release)
-                                .setOnClickAction {
-                                    checkUpdate(false)
-                                }
-                                .build())
-                        .addItem(
-                            MaterialAboutActionItem.Builder()
-                                .text(R.string.check_update_preview)
-                                .setOnClickAction {
-                                    checkUpdate(true)
-                                }
-                                .build())
-                        .addItem(
-                            MaterialAboutActionItem.Builder()
-                                .icon(R.drawable.ic_baseline_layers_24)
-                                .text(getString(R.string.version_x, "sing-box"))
-                                .subText(Libcore.versionBox())
-                                .setOnClickAction { }
-                                .build())
-                        .addItem(
-                            MaterialAboutActionItem.Builder()
-                                .icon(R.drawable.ic_baseline_card_giftcard_24)
-                                .text(R.string.donate)
-                                .subText(R.string.donate_info)
-                                .setOnClickAction {
-                                    requireContext().launchCustomTab(
-                                        "https://matsuridayo.github.io/index_docs/#donate"
-                                    )
-                                }
-                                .build())
                         .apply {
                             PackageCache.awaitLoadSync()
                             for ((_, pkg) in PackageCache.installedPluginPackages) {

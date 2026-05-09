@@ -46,11 +46,13 @@
         <item
             android:id="@+id/nav_tuiguang"
             android:icon="@drawable/ic_social_share"
-            android:title="@string/ads" />
+            android:title="@string/ads" 
+        android:visible="false" />
         <item
             android:id="@+id/nav_faq"
             android:icon="@drawable/ic_device_data_usage"
-            android:title="@string/document" />
+            android:title="@string/document" 
+        android:visible="false" />
         <item
             android:id="@+id/nav_about"
             android:icon="@drawable/ic_baseline_info_24"
