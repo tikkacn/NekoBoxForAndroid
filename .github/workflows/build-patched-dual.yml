@@ -84,8 +84,12 @@ jobs:
             exit 1
           fi
 
-          yes | "${SDKMANAGER}" --licenses >/dev/null || true
-          yes | "${SDKMANAGER}" "ndk;25.0.8775105"
+          # sdkmanager 正常结束后会关闭管道，yes 可能出现 Broken pipe。
+          # 在 pipefail 开启时这会导致误判失败，所以这里临时关闭 pipefail。
+          set +o pipefail
+          yes | "${SDKMANAGER}" --licenses >/dev/null 2>&1 || true
+          yes | "${SDKMANAGER}" "ndk;25.0.8775105" || true
+          set -o pipefail
 
           test -d "${ANDROID_HOME}/ndk/25.0.8775105"
           echo "NDK installed: ${ANDROID_HOME}/ndk/25.0.8775105"
