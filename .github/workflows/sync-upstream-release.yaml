@@ -6,6 +6,10 @@ on:
     # 每6小时检查一次上游是否发了新 Release；没更新就快速退出，不会浪费编译时间
     - cron: "0 */6 * * *"
 
+concurrency:
+  group: sync-upstream-release
+  cancel-in-progress: false
+
 permissions:
   contents: write
   actions: write
@@ -15,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TZ: Asia/Shanghai
+      BUILD_WORKFLOW_FILE: build-patched-dual.yml
 
     steps:
       - name: Checkout patched-release
@@ -25,7 +30,9 @@ jobs:
 
       - name: Git config
         run: |
-          git config user.name  "github-actions[bot]"
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Read upstream latest release tag
@@ -34,34 +41,35 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          TAG=$(curl -fsSL \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            https://api.github.com/repos/MatsuriDayo/NekoBoxForAndroid/releases/latest \
-            | jq -r .tag_name)
+
+          TAG=$(gh api repos/MatsuriDayo/NekoBoxForAndroid/releases/latest --jq '.tag_name')
 
           if [ -z "${TAG}" ] || [ "${TAG}" = "null" ]; then
             echo "Failed to get upstream tag_name."
             exit 1
           fi
+
           echo "UPSTREAM_TAG=${TAG}" >> "${GITHUB_ENV}"
           echo "Upstream latest tag: ${TAG}"
 
-      - name: Read current synced tag (from patched-release)
+      - name: Read current synced tag from patched-release
         id: current
         run: |
           set -euo pipefail
+
           CUR=""
           if [ -f .upstream_release_tag ]; then
-            CUR=$(cat .upstream_release_tag | tr -d '\r\n\t ')
+            CUR=$(tr -d '\r\n\t ' < .upstream_release_tag)
           fi
+
           echo "CURRENT_TAG=${CUR}" >> "${GITHUB_ENV}"
           echo "Current synced tag: ${CUR}"
 
-      - name: Compare tags (gate)
+      - name: Compare tags
         id: compare
         run: |
           set -euo pipefail
+
           if [ "${UPSTREAM_TAG}" = "${CURRENT_TAG}" ]; then
             echo "updated=false" >> "${GITHUB_OUTPUT}"
             echo "No upstream update. Exit."
@@ -70,206 +78,274 @@ jobs:
             echo "Upstream updated: ${CURRENT_TAG} -> ${UPSTREAM_TAG}"
           fi
 
-      - name: Backup workflows (keep ours)
+      - name: Add upstream remote and fetch tags
         if: steps.compare.outputs.updated == 'true'
         run: |
           set -euo pipefail
-          mkdir -p /tmp/keep_workflows
-          if [ -d .github/workflows ]; then
-            tar -czf /tmp/keep_workflows/workflows.tgz .github/workflows
-            echo "Backed up .github/workflows"
-          else
-            echo "No .github/workflows to backup"
-          fi
 
-      - name: Add upstream remote & fetch tags
-        if: steps.compare.outputs.updated == 'true'
-        run: |
-          set -euo pipefail
           git remote remove upstream 2>/dev/null || true
           git remote add upstream https://github.com/MatsuriDayo/NekoBoxForAndroid.git
-          git fetch upstream --tags --force
 
-      - name: Sync upstream tag -> patched-release (hard reset), then restore workflows
+          git fetch upstream --tags --force
+          git fetch origin main --force
+
+      - name: Sync upstream tag to patched-release by hard reset
         if: steps.compare.outputs.updated == 'true'
         run: |
           set -euo pipefail
+
+          git rev-parse "refs/tags/${UPSTREAM_TAG}" >/dev/null
           git reset --hard "refs/tags/${UPSTREAM_TAG}"
 
-          if [ -f /tmp/keep_workflows/workflows.tgz ]; then
-            rm -rf .github/workflows || true
-            tar -xzf /tmp/keep_workflows/workflows.tgz
-            echo "Restored .github/workflows"
-          fi
-
-      - name: Apply UI patches (About donate + hide nav items + remove handlers)
+      - name: Restore our workflow files from main
         if: steps.compare.outputs.updated == 'true'
         run: |
           set -euo pipefail
+
+          mkdir -p .github/workflows
+
+          git checkout origin/main -- .github/workflows || true
+
+          echo "Restored .github/workflows from origin/main"
+          ls -lah .github/workflows
+
+      - name: Apply UI patches
+        if: steps.compare.outputs.updated == 'true'
+        run: |
+          set -euo pipefail
+
           python3 - << 'PY'
-          import os, re
+          import os
+          import re
+          import sys
+
+          errors = []
 
           def read(path):
-            with open(path, "r", encoding="utf-8") as f:
-              return f.read()
+              with open(path, "r", encoding="utf-8") as f:
+                  return f.read()
 
           def write(path, s):
-            with open(path, "w", encoding="utf-8") as f:
-              f.write(s)
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(s)
 
-          def warn(msg): print("[WARN]", msg)
-          def ok(msg): print("[OK]", msg)
+          def warn(msg):
+              print("[WARN]", msg)
+
+          def ok(msg):
+              print("[OK]", msg)
+
+          def fail(msg):
+              errors.append(msg)
+              print("[ERROR]", msg)
 
           # -------- Patch 1: AboutFragment remove donate item --------
+          # 这个不是关键补丁，找不到只警告，不终止
           about_path = "app/src/main/java/io/nekohasekai/sagernet/ui/AboutFragment.kt"
+
           if os.path.exists(about_path):
-            s = read(about_path)
+              s = read(about_path)
 
-            pattern = re.compile(
-              r"""\.addItem\(\s*MaterialAboutActionItem\.Builder\(\)\s*
-                  (?:.|\n)*?\.text\(\s*R\.string\.donate\s*\)\s*
-                  (?:.|\n)*?\.build\(\)\s*\)\s*""",
-              re.X
-            )
-            s2, n = pattern.subn("", s, count=1)
-
-            if n == 0:
-              pattern2 = re.compile(
-                r"""\.addItem\(\s*
-                    (?:.|\n)*?R\.string\.donate
-                    (?:.|\n)*?\.build\(\)\s*\)\s*""",
-                re.X
+              pattern = re.compile(
+                  r"""\.addItem\(\s*MaterialAboutActionItem\.Builder\(\)\s*
+                      (?:.|\n)*?\.text\(\s*R\.string\.donate\s*\)\s*
+                      (?:.|\n)*?\.build\(\)\s*\)\s*""",
+                  re.X,
               )
-              s2, n = pattern2.subn("", s, count=1)
 
-            if n > 0:
-              write(about_path, s2)
-              ok("Remove donate item in AboutFragment")
-            else:
-              warn(f"Remove donate item in AboutFragment: pattern not found, skip ({about_path})")
+              s2, n = pattern.subn("", s, count=1)
+
+              if n == 0:
+                  pattern2 = re.compile(
+                      r"""\.addItem\(\s*
+                          (?:.|\n)*?R\.string\.donate
+                          (?:.|\n)*?\.build\(\)\s*\)\s*""",
+                      re.X,
+                  )
+                  s2, n = pattern2.subn("", s, count=1)
+
+              if n > 0:
+                  write(about_path, s2)
+                  ok("Remove donate item in AboutFragment")
+              else:
+                  warn(f"Remove donate item in AboutFragment: pattern not found, skip ({about_path})")
           else:
-            warn(f"AboutFragment not found: {about_path}")
+              warn(f"AboutFragment not found: {about_path}")
 
           # -------- Patch 2: Hide drawer menu items --------
+          # 这是关键补丁，nav_tuiguang / nav_faq 找不到或无法隐藏则失败
           menu_path = "app/src/main/res/menu/main_drawer_menu.xml"
+
           if os.path.exists(menu_path):
-            s = read(menu_path)
+              s = read(menu_path)
 
-            def hide_item(xml: str, item_id: str):
-              pat = re.compile(rf'(<item\b[^>]*\bandroid:id="@\+id/{re.escape(item_id)}"[^>]*)(/?>)', re.M)
-              m = pat.search(xml)
-              if not m:
-                return xml, False, f"not found ({item_id})"
-              head, tail = m.group(1), m.group(2)
+              def hide_item(xml, item_id):
+                  pat = re.compile(
+                      rf'(<item\b[^>]*\bandroid:id="@\+id/{re.escape(item_id)}"[^>]*)(/?>)',
+                      re.M,
+                  )
 
-              if 'android:visible=' in head:
-                head2 = re.sub(r'android:visible="[^"]*"', 'android:visible="false"', head)
-              else:
-                head2 = head + '\n            android:visible="false"'
-              xml2 = xml[:m.start()] + head2 + tail + xml[m.end():]
-              return xml2, True, "ok"
+                  m = pat.search(xml)
+                  if not m:
+                      return xml, False, f"not found ({item_id})"
 
-            changed_any = False
-            for item in ("nav_tuiguang", "nav_faq"):
-              s2, changed, msg = hide_item(s, item)
-              if changed:
-                s = s2
-                changed_any = True
-                ok(f'Hide {item} in {menu_path}')
-              else:
-                warn(f'Hide {item} in {menu_path}: {msg}, skip')
+                  head, tail = m.group(1), m.group(2)
 
-            if changed_any:
-              write(menu_path, s)
+                  if 'android:visible=' in head:
+                      head2 = re.sub(
+                          r'android:visible="[^"]*"',
+                          'android:visible="false"',
+                          head,
+                      )
+                  else:
+                      head2 = head + '\n            android:visible="false"'
+
+                  xml2 = xml[:m.start()] + head2 + tail + xml[m.end():]
+                  return xml2, True, "ok"
+
+              changed_any = False
+
+              for item in ("nav_tuiguang", "nav_faq"):
+                  s2, changed, msg = hide_item(s, item)
+
+                  if changed:
+                      s = s2
+                      changed_any = True
+                      ok(f"Hide {item} in {menu_path}")
+                  else:
+                      fail(f"Hide {item} in {menu_path}: {msg}")
+
+              if changed_any:
+                  write(menu_path, s)
           else:
-            warn(f"Drawer menu xml not found: {menu_path}")
+              fail(f"Drawer menu xml not found: {menu_path}")
 
-          # -------- Patch 3: MainActivity remove handlers + force hide --------
+          # -------- Patch 3: MainActivity remove handlers and force hide --------
+          # 删除点击逻辑找不到时先警告，避免上游轻微改动导致完全同步失败
           main_path = "app/src/main/java/io/nekohasekai/sagernet/ui/MainActivity.kt"
+
           if os.path.exists(main_path):
-            s = read(main_path)
-            orig = s
+              s = read(main_path)
+              orig = s
 
-            s, _ = re.subn(
-              r'(navigation\.menu\.findItem\(R\.id\.nav_tuiguang\)\?\.(?:isVisible|setVisible)\s*=\s*).*$',
-              r'\1false',
-              s,
-              flags=re.M
-            )
+              s, n_hide_tuiguang = re.subn(
+                  r'(navigation\.menu\.findItem\(R\.id\.nav_tuiguang\)\?\.(?:isVisible|setVisible)\s*=\s*).*',
+                  r'\1false',
+                  s,
+                  flags=re.M,
+              )
 
-            if "findItem(R.id.nav_faq)?.isVisible" not in s:
-              pat_insert = re.compile(r'(navigation\.menu\.findItem\(R\.id\.nav_tuiguang\)\?\.(?:isVisible|setVisible)\s*=\s*false\s*\n)')
-              if pat_insert.search(s):
-                s = pat_insert.sub(r'\1        navigation.menu.findItem(R.id.nav_faq)?.isVisible = false\n', s, count=1)
-                ok("Add hide line for nav_faq")
+              if n_hide_tuiguang > 0:
+                  ok("Force hide nav_tuiguang in MainActivity")
               else:
-                warn("Could not find nav_tuiguang hide line to insert nav_faq hide; skip insert")
+                  warn("nav_tuiguang hide line not found in MainActivity, skip force hide")
 
-            def remove_when_case(code: str, case_id: str):
-              key = f"R.id.{case_id} -> {{"
-              idx = code.find(key)
-              if idx == -1:
-                return code, False
-              i = idx + len(key)
-              depth = 1
-              while i < len(code) and depth > 0:
-                if code[i] == "{":
-                  depth += 1
-                elif code[i] == "}":
-                  depth -= 1
-                i += 1
-              j = i
-              while j < len(code) and code[j] in " \t\r\n":
-                j += 1
-              line_start = code.rfind("\n", 0, idx)
-              start = line_start + 1 if line_start != -1 else idx
-              return code[:start] + code[j:], True
+              if "findItem(R.id.nav_faq)?.isVisible" not in s:
+                  pat_insert = re.compile(
+                      r'(navigation\.menu\.findItem\(R\.id\.nav_tuiguang\)\?\.(?:isVisible|setVisible)\s*=\s*false\s*\n)'
+                  )
 
-            s, rm1 = remove_when_case(s, "nav_faq")
-            ok("Remove nav_faq handler block") if rm1 else warn("Remove nav_faq handler block: not found, skip")
+                  if pat_insert.search(s):
+                      s = pat_insert.sub(
+                          r'\1        navigation.menu.findItem(R.id.nav_faq)?.isVisible = false\n',
+                          s,
+                          count=1,
+                      )
+                      ok("Add hide line for nav_faq in MainActivity")
+                  else:
+                      warn("Could not find nav_tuiguang hide line to insert nav_faq hide; skip insert")
+              else:
+                  ok("nav_faq hide line already exists in MainActivity")
 
-            s, rm2 = remove_when_case(s, "nav_tuiguang")
-            ok("Remove nav_tuiguang handler block") if rm2 else warn("Remove nav_tuiguang handler block: not found, skip")
+              def remove_when_case(code, case_id):
+                  key = f"R.id.{case_id} -> {{"
+                  idx = code.find(key)
 
-            if s != orig:
-              write(main_path, s)
+                  if idx == -1:
+                      return code, False
+
+                  i = idx + len(key)
+                  depth = 1
+
+                  while i < len(code) and depth > 0:
+                      if code[i] == "{":
+                          depth += 1
+                      elif code[i] == "}":
+                          depth -= 1
+                      i += 1
+
+                  j = i
+                  while j < len(code) and code[j] in " \t\r\n":
+                      j += 1
+
+                  line_start = code.rfind("\n", 0, idx)
+                  start = line_start + 1 if line_start != -1 else idx
+
+                  return code[:start] + code[j:], True
+
+              s, rm1 = remove_when_case(s, "nav_faq")
+              if rm1:
+                  ok("Remove nav_faq handler block")
+              else:
+                  warn("Remove nav_faq handler block: not found, skip")
+
+              s, rm2 = remove_when_case(s, "nav_tuiguang")
+              if rm2:
+                  ok("Remove nav_tuiguang handler block")
+              else:
+                  warn("Remove nav_tuiguang handler block: not found, skip")
+
+              if s != orig:
+                  write(main_path, s)
           else:
-            warn(f"MainActivity not found: {main_path}")
+              warn(f"MainActivity not found: {main_path}")
+
+          if errors:
+              print("")
+              print("Patch failed:")
+              for e in errors:
+                  print("-", e)
+              sys.exit(1)
+
+          print("")
+          print("All required UI patches applied.")
           PY
 
       - name: Record synced tag
         if: steps.compare.outputs.updated == 'true'
         run: |
           set -euo pipefail
+
           echo "${UPSTREAM_TAG}" > .upstream_release_tag
 
-      - name: Commit changes (if any)
+      - name: Commit changes if any
         if: steps.compare.outputs.updated == 'true'
         run: |
           set -euo pipefail
+
           git add -A
+
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
+
           git commit -m "Sync upstream release ${UPSTREAM_TAG} + apply UI patches"
 
       - name: Push patched-release
         if: steps.compare.outputs.updated == 'true'
         run: |
           set -euo pipefail
+
           git push origin HEAD:patched-release --force-with-lease
 
-      - name: Trigger build workflow (only when updated)
+      - name: Trigger build workflow
         if: steps.compare.outputs.updated == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # 触发你仓库里的 build-patched-dual.yml（ref 固定 patched-release）
-          curl -fsSL -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/build-patched-dual.yml/dispatches \
-            -d "{\"ref\":\"patched-release\"}" >/dev/null
-          echo "Build workflow dispatched."
+
+          gh workflow run "${BUILD_WORKFLOW_FILE}" --ref patched-release
+
+          echo "Build workflow dispatched: ${BUILD_WORKFLOW_FILE}"
